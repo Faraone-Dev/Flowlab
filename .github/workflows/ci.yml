@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Rust workspace (pure): portable, no native FFI. ────────────────
+  rust:
+    name: rust / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  # ─── Rust + native FFI: C++ hot path + Zig feed-parser. ────────────
+  rust-native:
+    name: rust-native / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Zig 0.13.0
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Build Zig feed-parser static lib
+        working-directory: feed-parser
+        run: zig build -Doptimize=ReleaseFast
+      - name: Zig unit tests
+        working-directory: feed-parser
+        run: zig build test --summary all
+      - name: Build Rust + native FFI
+        run: cargo build -p flowlab-core --features native
+      - name: Run native-gated benches (compile only, --no-run)
+        run: cargo bench -p flowlab-bench --bench pipeline --features native --no-run
+
+  # ─── Go workspace (ingest). ────────────────────────────────────────
+  go:
+    name: go / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Go vet
+        run: go vet ./...
+        working-directory: ingest
+      - name: Go build
+        run: go build ./...
+        working-directory: ingest
+      - name: Go test
+        run: go test -race -count=1 ./...
+        working-directory: ingest

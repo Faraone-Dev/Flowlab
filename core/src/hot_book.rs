@@ -1,0 +1,967 @@
+//! Hot-path order book — fixed-depth sorted arrays + slab-backed order index.
+//!
+//! Mirrors the C++ `OrderBook<MaxLevels>` template exactly.
+//!
+//! Three optimization levels:
+//!   L1: Sorted arrays, no heap (for the price grid), no trees — cache-contiguous
+//!   L2: 64-byte aligned struct for cache-line isolation, prefetch on depth scan
+//!   L3: SIMD depth sum (portable_simd), branch-free insertion via binary search + memmove
+//!
+//! ## Order index design (variance-stable, slab-backed)
+//!
+//! ITCH 5.0 cancel/trade messages carry only `order_id`, so we MUST keep
+//! a mapping `order_id → (price, qty, side)` somewhere. To minimise the
+//! cache footprint of that mapping we split it in two:
+//!
+//!   * `slab: Vec<OrderMeta>` — dense, contiguous storage of the order
+//!     payloads. Reused via `free_list` so it does not grow unbounded.
+//!   * `index: HashMap<u64, u32>` — maps external `order_id` to a slab
+//!     slot. Entries are 12 B (8+4) instead of 32 B (8+24), so the same
+//!     cache line carries ~5× more entries → fewer misses on lookup.
+//!
+//! The hash uses **aHash with a fixed seed** for deterministic iteration
+//! order across runs (the canonical L2 hash never iterates the index, but
+//! we want bit-exact replays anyway).
+//!
+//! ## Hot-path performance characteristics (α frozen 2026-04-20)
+//!
+//! Measured by `bench/src/bin/latency_apply.rs` on a 3.79 GHz x86_64 box,
+//! 60/25/15 ADD/CANCEL/TRADE realistic mix, 256-deep book, ahash-backed
+//! slab. See [`../../docs/latency-alpha.md`] for the full report and
+//! reproduction recipe.
+//!
+//! | Metric (STEADY mix, 500 000 events) | Baseline | α      |
+//! |-------------------------------------|----------|--------|
+//! | TRADE p50                           |  72 ns   |  30 ns |
+//! | TRADE p99                           | 352 ns   | 128 ns |
+//! | TOTAL p99                           | 160 ns   |  88 ns |
+//! | Wall apply-only (500k events)       | 22.5 ms  | 17.1 ms|
+//!
+//! Two changes carried the gain:
+//! 1. `trade()` hot/cold split — partial-fill is straight-line, full-fill
+//!    and anonymous-trade are out-of-line `#[cold]` helpers.
+//! 2. [`HotOrderBook::prefetch_event`] — `_mm_prefetch T0` on the slab
+//!    slot AND on the bids/asks top cache lines, called by the producer
+//!    one event ahead of the matching [`HotOrderBook::apply`].
+//!
+//! [`HotOrderBook::apply_lanes`] (lane-separated 3-pass apply) was tried
+//! and **rejected** for realtime: correct (canonical hash bit-exact) but
+//! +8.8 % wall on the same input. Retained for future batch / offline use.
+
+use crate::event::{Event, EventType, Side};
+use crate::types::Price;
+use hashbrown::HashMap;
+use std::hash::BuildHasherDefault;
+
+/// Fixed-seed aHash builder — deterministic across runs and processes.
+type FxBuild = BuildHasherDefault<ahash::AHasher>;
+
+/// Single price level — 20 bytes + 4 pad = 24 bytes.
+/// Aligned to 8 bytes so arrays of Level have predictable stride.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C, align(8))]
+pub struct Level {
+    pub price: u64,
+    pub total_qty: u64,
+    pub order_count: u32,
+    _pad: u32,
+}
+
+/// Fixed-depth L2 order book. No heap. No trees. No HashMap.
+///
+/// **L2**: `align(64)` ensures the struct starts on a cache-line boundary,
+/// preventing false sharing when multiple books live in adjacent memory.
+///
+/// **L3**: Binary search + `ptr::copy` for insertion (memmove, not bubble swap),
+/// SIMD-friendly depth summation via manual unrolling + compiler auto-vectorization.
+///
+/// Generic over `MAX_LEVELS` — compile-time depth like the C++ template.
+/// Bids sorted descending, asks ascending — best prices always at index 0.
+#[derive(Debug, Clone)]
+#[repr(C, align(64))]
+pub struct HotOrderBook<const MAX_LEVELS: usize = 256> {
+    pub instrument_id: u32,
+    bid_count: u32,
+    ask_count: u32,
+    _pad: u32,
+    bids: [Level; MAX_LEVELS],
+    /// Cache-line gap between bids and asks — prevents false sharing
+    /// when the same book is read concurrently or when SIMD loads
+    /// accidentally straddle the boundary.
+    _gap: [u8; 64],
+    asks: [Level; MAX_LEVELS],
+    /// Off-hot-path: dense slab + sparse index for `order_id` resolution
+    /// of ITCH cancel/trade messages.
+    ///
+    /// Heap-allocated and **always sits AFTER the cache-line gap** so the
+    /// bid/ask grids stay isolated.
+    orders: OrderSlab,
+}
+
+/// Per-order metadata: price it sits at, remaining qty, and side.
+/// Stored in a dense `Vec` (the slab); the hash index points to it by `u32`.
+#[derive(Debug, Clone, Copy)]
+struct OrderMeta {
+    price: u64,
+    qty: u64,
+    side: u8,
+}
+
+/// Slab-backed order index. Two layers:
+///   * `data`: contiguous `Vec<OrderMeta>` — hot data lives here.
+///   * `index`: `HashMap<order_id, u32>` — cold lookup, 12 B/entry.
+#[derive(Debug, Clone)]
+struct OrderSlab {
+    data: Vec<OrderMeta>,
+    free_list: Vec<u32>,
+    index: HashMap<u64, u32, FxBuild>,
+}
+
+impl OrderSlab {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(cap),
+            free_list: Vec::with_capacity(cap / 4),
+            index: HashMap::with_capacity_and_hasher(cap, FxBuild::default()),
+        }
+    }
+
+    /// Insert (or overwrite) the metadata for `order_id`. O(1) amortised.
+    #[inline]
+    fn insert(&mut self, order_id: u64, meta: OrderMeta) {
+        match self.index.get(&order_id).copied() {
+            Some(slot) => {
+                self.data[slot as usize] = meta;
+            }
+            None => {
+                let slot = if let Some(s) = self.free_list.pop() {
+                    self.data[s as usize] = meta;
+                    s
+                } else {
+                    let s = self.data.len() as u32;
+                    self.data.push(meta);
+                    s
+                };
+                self.index.insert(order_id, slot);
+            }
+        }
+    }
+
+    /// Borrow the metadata for `order_id`, mutably.
+    #[inline]
+    fn get_mut(&mut self, order_id: u64) -> Option<&mut OrderMeta> {
+        let slot = *self.index.get(&order_id)?;
+        // SAFETY: index entries always reference live slab slots.
+        Some(unsafe { self.data.get_unchecked_mut(slot as usize) })
+    }
+
+    /// Remove the metadata for `order_id`, returning the previous value.
+    /// Frees the slab slot for reuse.
+    #[inline]
+    fn remove(&mut self, order_id: u64) -> Option<OrderMeta> {
+        let slot = self.index.remove(&order_id)?;
+        let meta = self.data[slot as usize];
+        self.free_list.push(slot);
+        Some(meta)
+    }
+}
+
+impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
+    pub fn new(instrument_id: u32) -> Self {
+        Self {
+            instrument_id,
+            bid_count: 0,
+            ask_count: 0,
+            _pad: 0,
+            bids: [Level::default(); MAX_LEVELS],
+            _gap: [0; 64],
+            asks: [Level::default(); MAX_LEVELS],
+            orders: OrderSlab::with_capacity(1024),
+        }
+    }
+
+    /// Apply a single event. Returns true if state changed.
+    #[inline]
+    pub fn apply(&mut self, event: &Event) -> bool {
+        let Some(event_type) = EventType::from_u8(event.event_type) else {
+            return false;
+        };
+        match event_type {
+            EventType::OrderAdd => self.add_order(event),
+            EventType::OrderCancel => self.cancel_order(event),
+            EventType::OrderModify => {
+                self.cancel_order(event);
+                self.add_order(event)
+            }
+            EventType::Trade => self.trade(event),
+            EventType::BookSnapshot => false,
+        }
+    }
+
+    /// **α prefetch hint** — issue a software prefetch for the slab slot
+    /// of the order referenced by `event` (TRADE / CANCEL / MODIFY) AND
+    /// for the top-of-book cache line of both sides of the price grid.
+    ///
+    /// Intended to be called *one or two events ahead* of the matching
+    /// `apply()` so the slot AND the level the binary search will touch
+    /// are L1-resident by the time the real lookup fires.
+    ///
+    /// Why prefetch both bid and ask top lines: at the prefetch point we
+    /// generally don't know the side without reading the slab slot
+    /// (which is itself the thing we're trying to bring in). Issuing
+    /// two unconditional prefetches on a tiny, hot, 64-byte-aligned
+    /// region costs ~2 cycles and removes the branch on `is_bid`.
+    /// `find_level` does a `partition_point` binary search which always
+    /// hits the first cache line of the side's level array sooner or
+    /// later (and very early when depth is shallow).
+    ///
+    /// ADD events skip the slab prefetch (they write a new slot, not
+    /// read an existing one) but still prefetch the level grid because
+    /// `add_order` itself does a binary-search insertion.
+    ///
+    /// No-op on non-x86_64 targets and when `order_id == 0`.
+    #[inline]
+    pub fn prefetch_event(&self, event: &Event) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+            let t = event.event_type;
+            let needs_lookup = t == EventType::Trade as u8
+                || t == EventType::OrderCancel as u8
+                || t == EventType::OrderModify as u8;
+
+            // Slab slot prefetch — only for events that read an existing oid.
+            if needs_lookup && event.order_id != 0 {
+                if let Some(&slot) = self.orders.index.get(&event.order_id) {
+                    let ptr = self.orders.data.as_ptr().wrapping_add(slot as usize);
+                    unsafe { _mm_prefetch(ptr as *const i8, _MM_HINT_T0) };
+                }
+            }
+
+            // Level-grid top-of-book prefetch — for ANY event that hits
+            // `find_level` (ADD insertion, CANCEL, TRADE, MODIFY).
+            let touches_grid = needs_lookup || t == EventType::OrderAdd as u8;
+            if touches_grid {
+                let bids_ptr = self.bids.as_ptr() as *const i8;
+                let asks_ptr = self.asks.as_ptr() as *const i8;
+                unsafe {
+                    _mm_prefetch(bids_ptr, _MM_HINT_T0);
+                    _mm_prefetch(asks_ptr, _MM_HINT_T0);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = event;
+        }
+    }
+
+    /// **Lane-separated batch apply** — three homogeneous passes over a
+    /// window of events instead of one interleaved loop.
+    ///
+    /// Pass 1: all ADDs (and the ADD half of MODIFYs)
+    /// Pass 2: all TRADEs
+    /// Pass 3: all CANCELs (and the CANCEL half of MODIFYs)
+    ///
+    /// ## Why this exists
+    ///
+    /// In an interleaved stream, the cache-line for the slab slot of
+    /// an order written by ADD #1 is typically evicted before the
+    /// matching TRADE #N arrives, because hundreds of unrelated ADDs
+    /// and CANCELs touched other slots in between. Each TRADE then
+    /// pays a cold-cache miss on the slab slot and on the price level.
+    ///
+    /// By processing all events of one type in a single pass, the
+    /// hot working set of that pass stays L1-resident: the slab slots
+    /// for the orders touched in this batch, the index buckets that
+    /// resolve them, and the contiguous price-level grid.
+    ///
+    /// ## Correctness (final state identical to interleaved `apply` loop)
+    ///
+    /// Holds for any event stream that satisfies ITCH semantics:
+    ///   * `order_id` is unique per ADD (no oid reuse within a batch);
+    ///   * CANCEL/TRADE for an oid never precedes its ADD;
+    ///   * MODIFY references an oid already present in the book.
+    ///
+    /// The lane ordering ADD → TRADE → CANCEL is chosen so that
+    /// within a single batch:
+    ///   - TRADEs against orders ADDed in this batch resolve correctly
+    ///     (slab populated by pass 1).
+    ///   - CANCELs of orders partially consumed by TRADEs cancel only
+    ///     the remaining qty (TRADE deducted its fill from the slab in
+    ///     pass 2).
+    ///   - Final level totals = sum over batch of (added − cancelled −
+    ///     traded) regardless of the intra-batch interleaving.
+    ///
+    /// Intermediate snapshots (mid-batch) ARE different from the
+    /// interleaved apply loop. This API is therefore appropriate for
+    /// settings where only the post-batch state is observable, which
+    /// is the standard case for an HFT engine that polls the book at
+    /// a fixed cadence.
+    pub fn apply_lanes(&mut self, events: &[Event]) -> usize {
+        self.apply_lane_adds(events)
+            + self.apply_lane_trades(events)
+            + self.apply_lane_cancels(events)
+    }
+
+    /// ADD lane (and the ADD half of MODIFY). See `apply_lanes` for
+    /// the correctness contract.
+    #[inline]
+    pub fn apply_lane_adds(&mut self, events: &[Event]) -> usize {
+        let mut changes = 0usize;
+        for e in events {
+            if e.event_type == EventType::OrderAdd as u8
+                || e.event_type == EventType::OrderModify as u8
+            {
+                if self.add_order(e) {
+                    changes += 1;
+                }
+            }
+        }
+        changes
+    }
+
+    /// TRADE lane.
+    #[inline]
+    pub fn apply_lane_trades(&mut self, events: &[Event]) -> usize {
+        let mut changes = 0usize;
+        for e in events {
+            if e.event_type == EventType::Trade as u8 {
+                if self.trade(e) {
+                    changes += 1;
+                }
+            }
+        }
+        changes
+    }
+
+    /// CANCEL lane.
+    #[inline]
+    pub fn apply_lane_cancels(&mut self, events: &[Event]) -> usize {
+        let mut changes = 0usize;
+        for e in events {
+            if e.event_type == EventType::OrderCancel as u8 {
+                if self.cancel_order(e) {
+                    changes += 1;
+                }
+            }
+        }
+        changes
+    }
+
+    // ─── Accessors ───────────────────────────────────────────────────
+
+    #[inline]
+    pub fn best_bid(&self) -> Option<Price> {
+        if self.bid_count > 0 {
+            Some(self.bids[0].price)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn best_ask(&self) -> Option<Price> {
+        if self.ask_count > 0 {
+            Some(self.asks[0].price)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn spread(&self) -> Option<u64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) if ask > bid => Some(ask - bid),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn bid_count(&self) -> usize {
+        self.bid_count as usize
+    }
+
+    #[inline]
+    pub fn ask_count(&self) -> usize {
+        self.ask_count as usize
+    }
+
+    /// Bid depth across top `n` levels.
+    ///
+    /// **L2**: Prefetch next cache line before the loop.
+    /// **L3**: 4-wide manual unroll lets the compiler emit `vpaddd`/`vpaddq`
+    /// on AVX2 or equivalent NEON — no explicit intrinsics needed.
+    #[inline]
+    pub fn bid_depth(&self, n: usize) -> u64 {
+        Self::depth_sum(&self.bids, self.bid_count as usize, n)
+    }
+
+    /// Ask depth across top `n` levels.
+    #[inline]
+    pub fn ask_depth(&self, n: usize) -> u64 {
+        Self::depth_sum(&self.asks, self.ask_count as usize, n)
+    }
+
+    /// **L3**: 4-wide unrolled depth sum — compiler auto-vectorizes this
+    /// into SIMD on x86-64 with `-C target-cpu=native`.
+    /// Prefetch hint (L2) at +2 cache lines ahead of the read cursor.
+    #[inline(always)]
+    fn depth_sum(levels: &[Level; MAX_LEVELS], count: usize, n: usize) -> u64 {
+        let n = n.min(count);
+
+        // L2: prefetch the first 2 cache lines of level data
+        if n > 0 {
+            // SAFETY: pointer is within our own stack/heap allocation
+            unsafe {
+                let ptr = levels.as_ptr() as *const u8;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                    core::arch::x86_64::_mm_prefetch(ptr.add(64) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                }
+                let _ = ptr; // suppress unused on non-x86
+            }
+        }
+
+        // L3: 4-wide unrolled accumulation — auto-vectorizable
+        let mut d0: u64 = 0;
+        let mut d1: u64 = 0;
+        let mut d2: u64 = 0;
+        let mut d3: u64 = 0;
+
+        let chunks = n / 4;
+        let remainder = n % 4;
+
+        for c in 0..chunks {
+            let base = c * 4;
+            d0 += levels[base].total_qty;
+            d1 += levels[base + 1].total_qty;
+            d2 += levels[base + 2].total_qty;
+            d3 += levels[base + 3].total_qty;
+        }
+
+        let tail_base = chunks * 4;
+        for i in 0..remainder {
+            d0 += levels[tail_base + i].total_qty;
+        }
+
+        d0 + d1 + d2 + d3
+    }
+
+    /// Total bid depth (all levels).
+    pub fn total_bid_depth(&self) -> u64 {
+        self.bid_depth(self.bid_count as usize)
+    }
+
+    /// Total ask depth (all levels).
+    pub fn total_ask_depth(&self) -> u64 {
+        self.ask_depth(self.ask_count as usize)
+    }
+
+    /// Direct read-only access to bid levels slice.
+    #[inline]
+    pub fn bid_levels(&self) -> &[Level] {
+        &self.bids[..self.bid_count as usize]
+    }
+
+    /// Direct read-only access to ask levels slice.
+    #[inline]
+    pub fn ask_levels(&self) -> &[Level] {
+        &self.asks[..self.ask_count as usize]
+    }
+
+    /// **Canonical L2 hash** — cross-language verification primitive.
+    ///
+    /// Produces an xxh3 digest over (price, total_qty) pairs from
+    /// best-bid down to worst-bid, then best-ask up to worst-ask.
+    /// This representation is identical across Rust/C++/Zig regardless
+    /// of internal storage, so two implementations agree iff the
+    /// observable L2 state agrees.
+    pub fn canonical_l2_hash(&self) -> u64 {
+        let mut buf = [0u8; 16];
+        // Start with fixed domain tag so we can't collide with empty input
+        let mut h = xxhash_rust::xxh3::xxh3_64(b"FLOWLAB-L2-v1");
+
+        for l in self.bid_levels() {
+            buf[0..8].copy_from_slice(&l.price.to_le_bytes());
+            buf[8..16].copy_from_slice(&l.total_qty.to_le_bytes());
+            h ^= xxhash_rust::xxh3::xxh3_64_with_seed(&buf, h);
+        }
+        // Side separator
+        h = xxhash_rust::xxh3::xxh3_64_with_seed(b"|", h);
+        for l in self.ask_levels() {
+            buf[0..8].copy_from_slice(&l.price.to_le_bytes());
+            buf[8..16].copy_from_slice(&l.total_qty.to_le_bytes());
+            h ^= xxhash_rust::xxh3::xxh3_64_with_seed(&buf, h);
+        }
+        h
+    }
+
+    // ─── Mutations ───────────────────────────────────────────────────
+
+    /// **L3**: Binary search for the level, then either update in place
+    /// (existing) or `ptr::copy` (memmove) to open a slot for a new level.
+    ///
+    /// Also records the order in the `orders` lookup map (iff `order_id != 0`)
+    /// so subsequent `OrderCancel` / `Trade` messages can resolve by order_id
+    /// alone \u2014 matching real ITCH 5.0 semantics.
+    fn add_order(&mut self, e: &Event) -> bool {
+        let price = e.price;
+        let qty = e.qty;
+        let is_bid = e.side == Side::Bid as u8;
+
+        let (levels, count) = if is_bid {
+            (&mut self.bids, &mut self.bid_count)
+        } else {
+            (&mut self.asks, &mut self.ask_count)
+        };
+        let cnt = *count as usize;
+
+        // Binary search for insertion point. `partition_point` is
+        // branchless on monotonic predicates.
+        let pos = if is_bid {
+            // Bids sorted descending: find first index where price < levels[i].price
+            levels[..cnt].partition_point(|l| l.price > price)
+        } else {
+            // Asks sorted ascending
+            levels[..cnt].partition_point(|l| l.price < price)
+        };
+
+        // Level already exists?
+        let level_ok = if pos < cnt && levels[pos].price == price {
+            levels[pos].total_qty += qty;
+            levels[pos].order_count += 1;
+            true
+        } else if cnt >= MAX_LEVELS {
+            // New level — capacity exhausted
+            false
+        } else {
+            // memmove to open slot at `pos`
+            if pos < cnt {
+                unsafe {
+                    let src = levels.as_ptr().add(pos);
+                    let dst = levels.as_mut_ptr().add(pos + 1);
+                    core::ptr::copy(src, dst, cnt - pos);
+                }
+            }
+            levels[pos] = Level {
+                price,
+                total_qty: qty,
+                order_count: 1,
+                _pad: 0,
+            };
+            *count = (cnt + 1) as u32;
+            true
+        };
+
+        if level_ok && e.order_id != 0 {
+            self.orders.insert(
+                e.order_id,
+                OrderMeta { price, qty, side: e.side },
+            );
+        }
+        level_ok
+    }
+
+    /// Find level index by price using binary search.
+    /// Returns `Some(idx)` if found.
+    #[inline]
+    fn find_level(levels: &[Level], cnt: usize, price: Price, is_bid: bool) -> Option<usize> {
+        let pos = if is_bid {
+            levels[..cnt].partition_point(|l| l.price > price)
+        } else {
+            levels[..cnt].partition_point(|l| l.price < price)
+        };
+        if pos < cnt && levels[pos].price == price {
+            Some(pos)
+        } else {
+            None
+        }
+    }
+
+    /// Cancel an order. Resolution priority:
+    ///   1. `order_id != 0` and present in the lookup map \u2192 use stored
+    ///      `(price, side, qty)` (ITCH 5.0 semantics: `D` carries only oid).
+    ///   2. `order_id != 0` and not present \u2192 drop the message (return
+    ///      `false`), matching `OrderBook` (BTreeMap) behaviour on unknown
+    ///      cancel refs.
+    ///   3. `order_id == 0` (legacy / synthetic pre-enriched events) \u2192
+    ///      fall back to `(event.price, event.side, event.qty)`.
+    fn cancel_order(&mut self, e: &Event) -> bool {
+        let (price, qty, is_bid) = if e.order_id != 0 {
+            match self.orders.remove(e.order_id) {
+                Some(meta) => (meta.price, meta.qty, meta.side == Side::Bid as u8),
+                None => return false,
+            }
+        } else {
+            (e.price, e.qty, e.side == Side::Bid as u8)
+        };
+
+        let (levels, count) = if is_bid {
+            (&mut self.bids, &mut self.bid_count)
+        } else {
+            (&mut self.asks, &mut self.ask_count)
+        };
+        let cnt = *count as usize;
+
+        if let Some(i) = Self::find_level(levels, cnt, price, is_bid) {
+            levels[i].total_qty = levels[i].total_qty.saturating_sub(qty);
+            levels[i].order_count = levels[i].order_count.saturating_sub(1);
+
+            if levels[i].order_count == 0 {
+                Self::remove_level(levels, count, i);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Apply a trade. Uses the same `order_id`-first resolution as `cancel_order`.
+    /// The traded qty is deducted from the level; if the order is fully
+    /// consumed, its metadata entry is dropped and the level's order_count
+    /// is decremented, possibly removing the level.
+    ///
+    /// When `order_id != 0` and the order is not in the lookup map, the
+    /// trade is dropped (return `false`) \u2014 matching `OrderBook` (BTreeMap)
+    /// semantics where `execute_trade` fails on unknown order refs (typical
+    /// of ITCH `P` messages that reference trades outside the book).
+    #[inline]
+    fn trade(&mut self, e: &Event) -> bool {
+        // Synthetic / pre-enriched path (no oid).
+        if e.order_id == 0 {
+            return self.trade_anon(e.price, e.qty, e.side == Side::Bid as u8);
+        }
+
+        let Some(meta) = self.orders.get_mut(e.order_id) else {
+            return false;
+        };
+        let fill = e.qty.min(meta.qty);
+        let new_qty = meta.qty - fill;
+        let price = meta.price;
+        let is_bid = meta.side == Side::Bid as u8;
+
+        if new_qty != 0 {
+            // HOT: partial fill. No slab eviction, no level removal,
+            // no order_count change. Single straight-line update.
+            meta.qty = new_qty;
+            let (levels, count) = if is_bid {
+                (&mut self.bids[..], self.bid_count as usize)
+            } else {
+                (&mut self.asks[..], self.ask_count as usize)
+            };
+            if let Some(i) = Self::find_level(levels, count, price, is_bid) {
+                levels[i].total_qty = levels[i].total_qty.saturating_sub(fill);
+                return true;
+            }
+            return false;
+        }
+
+        // COLD: order fully consumed.
+        self.trade_full_fill(e.order_id, price, fill, is_bid)
+    }
+
+    /// Cold path: order fully consumed by the trade. Out-of-line so the
+    /// hot partial-fill path stays branch-light and i-cache compact.
+    #[cold]
+    #[inline(never)]
+    fn trade_full_fill(&mut self, order_id: u64, price: u64, fill: u64, is_bid: bool) -> bool {
+        self.orders.remove(order_id);
+        let (levels, count) = if is_bid {
+            (&mut self.bids, &mut self.bid_count)
+        } else {
+            (&mut self.asks, &mut self.ask_count)
+        };
+        let cnt = *count as usize;
+        if let Some(i) = Self::find_level(levels, cnt, price, is_bid) {
+            levels[i].total_qty = levels[i].total_qty.saturating_sub(fill);
+            levels[i].order_count = levels[i].order_count.saturating_sub(1);
+            if levels[i].order_count == 0 {
+                Self::remove_level(levels, count, i);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Anonymous TRADE (no order_id). Pre-enriched / synthetic stream.
+    #[cold]
+    #[inline(never)]
+    fn trade_anon(&mut self, price: u64, qty: u64, is_bid: bool) -> bool {
+        let (levels, count) = if is_bid {
+            (&mut self.bids, &mut self.bid_count)
+        } else {
+            (&mut self.asks, &mut self.ask_count)
+        };
+        let cnt = *count as usize;
+        if let Some(i) = Self::find_level(levels, cnt, price, is_bid) {
+            levels[i].total_qty = levels[i].total_qty.saturating_sub(qty);
+            if levels[i].order_count == 0 {
+                Self::remove_level(levels, count, i);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Remove level at index `i` — memmove remaining left.
+    #[inline]
+    fn remove_level(levels: &mut [Level; MAX_LEVELS], count: &mut u32, i: usize) {
+        let cnt = *count as usize;
+        if i < cnt - 1 {
+            unsafe {
+                let src = levels.as_ptr().add(i + 1);
+                let dst = levels.as_mut_ptr().add(i);
+                core::ptr::copy(src, dst, cnt - i - 1);
+            }
+        }
+        levels[cnt - 1] = Level::default();
+        *count = (cnt - 1) as u32;
+    }
+}
+
+// ─── Compile-time verification ───────────────────────────────────────
+
+const _: () = {
+    // Level is 24 bytes (8-byte aligned)
+    assert!(core::mem::size_of::<Level>() == 24);
+    // HotOrderBook<256> is 64-byte aligned
+    assert!(core::mem::align_of::<HotOrderBook<256>>() == 64);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{EventType, Side};
+
+    fn make_event(event_type: EventType, side: Side, price: u64, qty: u64) -> Event {
+        Event {
+            ts: 0,
+            instrument_id: 1,
+            event_type: event_type as u8,
+            side: side as u8,
+            price,
+            qty,
+            order_id: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    fn make_event_oid(
+        event_type: EventType,
+        side: Side,
+        price: u64,
+        qty: u64,
+        order_id: u64,
+    ) -> Event {
+        Event {
+            ts: 0,
+            instrument_id: 1,
+            event_type: event_type as u8,
+            side: side as u8,
+            price,
+            qty,
+            order_id,
+            _pad: [0; 2],
+        }
+    }
+
+    #[test]
+    fn test_cache_line_alignment() {
+        let book = HotOrderBook::<64>::new(1);
+        let addr = &book as *const _ as usize;
+        assert_eq!(addr % 64, 0, "HotOrderBook must be 64-byte aligned");
+    }
+
+    #[test]
+    fn test_add_and_spread() {
+        let mut book = HotOrderBook::<64>::new(1);
+
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100, 10));
+        book.apply(&make_event(EventType::OrderAdd, Side::Ask, 105, 5));
+
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.best_ask(), Some(105));
+        assert_eq!(book.spread(), Some(5));
+        assert_eq!(book.bid_depth(1), 10);
+        assert_eq!(book.ask_depth(1), 5);
+    }
+
+    #[test]
+    fn test_cancel_removes_level() {
+        let mut book = HotOrderBook::<64>::new(1);
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100, 10));
+        book.apply(&make_event(EventType::OrderCancel, Side::Bid, 100, 10));
+
+        assert_eq!(book.bid_count(), 0);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_sorted_insertion_binary_search() {
+        let mut book = HotOrderBook::<64>::new(1);
+
+        // Add bids out of order — binary search insertion
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100, 10));
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 110, 5));
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 105, 3));
+
+        // Bids descending: 110, 105, 100
+        assert_eq!(book.bid_levels()[0].price, 110);
+        assert_eq!(book.bid_levels()[1].price, 105);
+        assert_eq!(book.bid_levels()[2].price, 100);
+
+        // Add asks out of order
+        book.apply(&make_event(EventType::OrderAdd, Side::Ask, 120, 2));
+        book.apply(&make_event(EventType::OrderAdd, Side::Ask, 115, 7));
+
+        // Asks ascending: 115, 120
+        assert_eq!(book.ask_levels()[0].price, 115);
+        assert_eq!(book.ask_levels()[1].price, 120);
+    }
+
+    #[test]
+    fn test_trade_depletes() {
+        let mut book = HotOrderBook::<64>::new(1);
+        // Use a tracked order_id so `trade` resolves via the lookup map
+        // (which decrements `order_count` on full fills, matching the
+        // BTreeMap reference implementation).
+        book.apply(&make_event_oid(EventType::OrderAdd, Side::Ask, 100, 20, 42));
+
+        // Partial fill: 15 of 20
+        book.apply(&make_event_oid(EventType::Trade, Side::Ask, 100, 15, 42));
+        assert_eq!(book.ask_levels()[0].total_qty, 5);
+        assert_eq!(book.ask_count(), 1);
+
+        // Full fill of remainder: order_count -> 0 removes the level
+        book.apply(&make_event_oid(EventType::Trade, Side::Ask, 100, 5, 42));
+        assert_eq!(book.ask_count(), 0);
+    }
+
+    #[test]
+    fn test_depth_sum_unrolled() {
+        let mut book = HotOrderBook::<64>::new(1);
+
+        // Add 7 bid levels to test 4-wide unroll + 3 remainder
+        for p in 0..7u64 {
+            book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100 + p, 10));
+        }
+
+        assert_eq!(book.bid_depth(7), 70);
+        assert_eq!(book.bid_depth(4), 40);
+        assert_eq!(book.bid_depth(1), 10);
+    }
+
+    #[test]
+    fn test_many_levels_stress() {
+        let mut book = HotOrderBook::<256>::new(1);
+
+        // Fill 200 bid levels
+        for p in 0..200u64 {
+            book.apply(&make_event(EventType::OrderAdd, Side::Bid, 1000 + p, 1));
+        }
+        assert_eq!(book.bid_count(), 200);
+        // Best bid should be highest price (1199)
+        assert_eq!(book.best_bid(), Some(1199));
+
+        // Cancel middle level
+        book.apply(&make_event(EventType::OrderCancel, Side::Bid, 1100, 1));
+        assert_eq!(book.bid_count(), 199);
+
+        // Levels should still be sorted
+        let levels = book.bid_levels();
+        for w in levels.windows(2) {
+            assert!(w[0].price > w[1].price, "bids must be descending");
+        }
+    }
+
+    #[test]
+    fn test_itch_cancel_resolves_via_order_id() {
+        // ITCH `OrderDelete` (`D`) carries only `order_id` — price/qty/side
+        // are zero on the wire. The book must still locate the owning
+        // level via the internal lookup map.
+        let mut book = HotOrderBook::<64>::new(1);
+        book.apply(&make_event_oid(EventType::OrderAdd, Side::Bid, 100, 10, 7));
+        book.apply(&make_event_oid(EventType::OrderAdd, Side::Bid, 100, 15, 8));
+        assert_eq!(book.bid_count(), 1);
+        assert_eq!(book.bid_levels()[0].total_qty, 25);
+
+        // ITCH-style cancel: price=0, qty=0, side=0 — resolved via order_id=7
+        let cancel = make_event_oid(EventType::OrderCancel, Side::Bid, 0, 0, 7);
+        assert!(book.apply(&cancel));
+        assert_eq!(book.bid_count(), 1);
+        assert_eq!(book.bid_levels()[0].total_qty, 15); // qty deducted by 10 (stored)
+
+        // Unknown order_id -> dropped (matches BTreeMap OrderBook)
+        let bogus = make_event_oid(EventType::OrderCancel, Side::Bid, 0, 0, 999);
+        assert!(!book.apply(&bogus));
+    }
+
+    /// **Lane equivalence** — `apply_lanes` must produce the same
+    /// canonical L2 hash as the serial `apply` loop on any
+    /// ITCH-conformant input (unique oids, CANCEL/TRADE strictly after
+    /// ADD, no oid reuse). Final state bit-exact identical.
+    #[test]
+    fn test_apply_lanes_matches_serial_canonical_hash() {
+        let mut events: Vec<Event> = Vec::with_capacity(2_000);
+        let mut next_oid: u64 = 1;
+        let mut live: Vec<(u64, u64, u8)> = Vec::new(); // (oid, price, side)
+
+        // Deterministic xorshift inline to avoid cross-crate deps.
+        let mut s: u64 = 0xA17E_F10A_BABE_2026;
+        let mut r = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        for i in 0..2_000u64 {
+            let pick = r() % 100;
+            let evt = if pick < 60 || live.is_empty() {
+                let side = (r() & 1) as u8;
+                let price = 10_000u64.saturating_sub(r() % 50) + (side as u64) * 100;
+                let qty = 10 + (r() % 90);
+                let oid = next_oid;
+                next_oid += 1;
+                live.push((oid, price, side));
+                make_event_oid(EventType::OrderAdd,
+                    if side == 0 { Side::Bid } else { Side::Ask },
+                    price, qty, oid)
+            } else if pick < 85 {
+                let idx = (r() as usize) % live.len();
+                let (oid, _, side) = live.swap_remove(idx);
+                make_event_oid(EventType::OrderCancel,
+                    if side == 0 { Side::Bid } else { Side::Ask },
+                    0, 0, oid)
+            } else {
+                let idx = (r() as usize) % live.len();
+                let (oid, _, side) = live[idx];
+                make_event_oid(EventType::Trade,
+                    if side == 0 { Side::Bid } else { Side::Ask },
+                    0, 1, oid)
+            };
+            let mut e = evt;
+            e.ts = i * 1_000;
+            events.push(e);
+        }
+
+        let mut serial = HotOrderBook::<256>::new(1);
+        for e in &events {
+            serial.apply(e);
+        }
+
+        let mut lanes = HotOrderBook::<256>::new(1);
+        // Process in batches of 64 to reflect realistic poll-cadence usage.
+        for chunk in events.chunks(64) {
+            lanes.apply_lanes(chunk);
+        }
+
+        assert_eq!(
+            serial.canonical_l2_hash(),
+            lanes.canonical_l2_hash(),
+            "apply_lanes must produce identical post-batch state to serial apply"
+        );
+    }
+}

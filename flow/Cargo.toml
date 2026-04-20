@@ -1,0 +1,9 @@
+[package]
+name = "flowlab-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flowlab-core = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,41 @@
+# Rust
+target/
+**/*.rs.bk
+
+# C++
+hotpath/build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Zig
+feed-parser/zig-out/
+feed-parser/zig-cache/
+feed-parser/.zig-cache/
+
+# Go
+*.exe
+go.sum
+
+# Data
+data/raw/
+data/normalized/
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local env
+.env
+.env.local
+*.pem
+*.key

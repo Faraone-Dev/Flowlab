@@ -1,0 +1,53 @@
+[package]
+name = "flowlab-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+flowlab-core.workspace = true
+flowlab-replay.workspace = true
+flowlab-flow.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+flowlab-core.workspace = true
+flowlab-replay.workspace = true
+flowlab-flow.workspace = true
+bytemuck.workspace = true
+
+[[test]]
+name = "e2e_clean_replay"
+path = "e2e/clean_replay.rs"
+
+[[test]]
+name = "e2e_cancel_heavy"
+path = "e2e/cancel_heavy.rs"
+
+[[test]]
+name = "e2e_stress_overflow"
+path = "e2e/stress_overflow.rs"
+
+[[test]]
+name = "fuzz_orderbook_consistency"
+path = "fuzz/orderbook_consistency.rs"
+
+[[test]]
+name = "fuzz_itch_parser"
+path = "fuzz/itch_parser.rs"
+
+[[test]]
+name = "chaos_burst_desync"
+path = "chaos/burst_desync.rs"
+
+[[test]]
+name = "chaos_corruption_injection"
+path = "chaos/corruption_injection.rs"
+
+[[test]]
+name = "chaos_long_run_drift"
+path = "chaos/long_run_drift.rs"
