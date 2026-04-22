@@ -51,6 +51,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			tick := s.feed.Next()
 			tick.Symbol, tick.InstrumentID = s.feed.Symbol()
 			tick.Trades = s.feed.RecentTrades()
+			if s.recorder != nil {
+				s.recorder.LogTick(tick)
+			}
 			if err := conn.WriteJSON(tick); err != nil {
 				return
 			}

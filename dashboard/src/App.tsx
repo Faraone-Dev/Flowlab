@@ -5,6 +5,9 @@ import { Ladder } from './Ladder';
 import { TradeTape } from './TradeTape';
 import { useStream, type StreamStatus } from './useStream';
 import { REGIME_NAME, type Tick } from './types';
+import { StormPanel, type StormSnapshot } from './StormPanel';
+import { BotPanel } from './BotPanel';
+import { RunPanel } from './RunPanel';
 
 const CAP = 600; // ~12 s at 50 Hz
 
@@ -74,6 +77,23 @@ export function App() {
   const [feedLabel, setFeedLabel] = useState('…');
   const [, setFrame] = useState(0);
   const [latest, setLatest] = useState<Tick | null>(null);
+  const [stormSnap, setStormSnap] = useState<StormSnapshot | null>(null);
+
+  const refreshStorm = async () => {
+    try {
+      const r = await fetch('/storm/status');
+      const j = (await r.json()) as StormSnapshot;
+      setStormSnap(j);
+    } catch {
+      /* ignore — panel falls back to idle */
+    }
+  };
+
+  useEffect(() => {
+    refreshStorm();
+    const id = setInterval(refreshStorm, 1000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,7 +105,7 @@ export function App() {
         .then((s: { mode?: string }) => {
           if (cancelled) return;
           const m = (s.mode ?? '').toLowerCase();
-          if (m.startsWith('engine')) setFeedLabel('ENGINE · NASDAQ BX ITCH');
+          if (m.startsWith('engine')) setFeedLabel('ENGINE · ITCH FEED');
           else if (m.startsWith('synthetic')) setFeedLabel('SYNTHETIC');
           else setFeedLabel(s.mode ?? 'UNKNOWN');
         })
@@ -173,10 +193,10 @@ export function App() {
   const symbol = latest?.symbol && latest.symbol.length > 0 ? latest.symbol : null;
   const instrument = latest?.instrument_id ?? 0;
   const headLeft = symbol
-    ? `${symbol} · NASDAQ`
+    ? `FLOWLAB · ${symbol}`
     : instrument
-      ? `LOCATE ${instrument} · NASDAQ`
-      : 'WARMING UP · NASDAQ';
+      ? `FLOWLAB · LOCATE ${instrument}`
+      : 'FLOWLAB · WARMING UP';
 
   const midPx = latest ? latest.mid_ticks / 10_000 : 0;
   const microPx = latest && latest.microprice_ticks ? latest.microprice_ticks / 10_000 : midPx;
@@ -221,18 +241,41 @@ export function App() {
       </header>
 
       <div className="board">
+        <aside className="kpi">
+          <div className="kpi-h">CHAOS DECK</div>
+          <Kpi k="MID" v={fmt(latest ? latest.mid_ticks / 10_000 : 0, 4)} />
+          <Kpi k="IMBALANCE" v={fmt(latest?.imbalance ?? 0, 3)} />
+          <Kpi k="BID DEPTH" v={fmt(latest?.bid_depth ?? 0, 0)} />
+          <Kpi k="ASK DEPTH" v={fmt(latest?.ask_depth ?? 0, 0)} />
+          <Kpi k="VPIN" v={fmt(latest?.vpin ?? 0, 3)} />
+          <Kpi k="EVT/S" v={fmt(latest?.events_per_sec ?? 0, 0)} />
+          <Kpi k="LAT P50" v={`${fmt(latest?.lat_p50_ns ?? 0, 0)} ns`} />
+          <Kpi k="LAT P99" v={`${fmt(latest?.lat_p99_ns ?? 0, 0)} ns`} />
+          <Kpi k="LAT P99.9" v={`${fmt(latest?.lat_p999_ns ?? 0, 0)} ns`} />
+          <Kpi k="LAT MAX" v={`${fmt(latest?.lat_max_ns ?? 0, 0)} ns`} />
+          <Kpi k="JITTER" v={`${fmt(latest?.lat_jitter_ns ?? 0, 0)} ns`} />
+          <Kpi k="DROPS" v={fmt(latest?.dropped_total ?? 0, 0)} />
+          <Kpi k="GAPS/MIN" v={fmt(latest?.gaps_last_minute ?? 0, 0)} />
+          <Kpi k="REGIME" v={REGIME_NAME[latest?.regime ?? 0]} />
+          <div className="kpi-strip">
+            <div className="kpi-strip-h">REGIME · 12s</div>
+            <div className="kpi-strip-b">
+              <RegimeStrip data={regime} />
+            </div>
+          </div>
+          <div className="kpi-actions">
+            <button onClick={() => fetch('/reset', { method: 'POST' })}>RESET BREAKER</button>
+          </div>
+          <StormPanel snap={stormSnap} onChange={refreshStorm} />
+          <RunPanel />
+          <BotPanel />
+        </aside>
+
         <div className="charts">
           <Card title="VPIN · TOXICITY" value={fmt(latest?.vpin ?? 0, 3)}>
-            {/* VPIN (volume-synchronised PIN) is the headline order-flow
-                toxicity metric. The mid is fixed by construction on the
-                synthetic feed, so plotting it is a flat line; VPIN moves
-                with every burst phase and is what the regime classifier
-                actually keys off. */}
             <Spark data={vpin} color="#f5a623" positiveOnly />
           </Card>
           <Card title="BOOK IMBALANCE" value={fmt(latest?.imbalance ?? 0, 3)}>
-            {/* Autoscale: real-world imbalance lives in ±0.05 most of the
-                time; clamping to ±1 made the line look frozen at zero. */}
             <Spark data={imb} color="#f5a623" />
           </Card>
           <Card
@@ -245,15 +288,9 @@ export function App() {
             title="LATENCY · P50 / P99 · ns"
             value={`${fmt(latest?.lat_p50_ns ?? 0, 0)} / ${fmt(latest?.lat_p99_ns ?? 0, 0)}`}
           >
-            <Spark data={p50} color="#4f8cff" data2={p99} color2="#ff3b30" positiveOnly />
+            <Spark data={p50} color="#4f8cff" data2={p99} color2="#ff3b30" logY />
           </Card>
         </div>
-
-        <section className="ladder-wrap">
-          <div className="ladder-h">ORDER BOOK · TOP 10</div>
-          <Ladder bids={latest?.bids ?? []} asks={latest?.asks ?? []} />
-          <StageLatStrip stages={latest?.stages} />
-        </section>
 
         <section className="tape-wrap">
           <div className="tape-h">TRADE TAPE</div>
@@ -263,28 +300,11 @@ export function App() {
           <TradeTape trades={latest?.trades ?? []} />
         </section>
 
-        <aside className="kpi">
-          <div className="kpi-h">RISK · OPS</div>
-          <Kpi k="MID" v={fmt(latest ? latest.mid_ticks / 10_000 : 0, 4)} />
-          <Kpi k="IMBALANCE" v={fmt(latest?.imbalance ?? 0, 3)} />
-          <Kpi k="BID DEPTH" v={fmt(latest?.bid_depth ?? 0, 0)} />
-          <Kpi k="ASK DEPTH" v={fmt(latest?.ask_depth ?? 0, 0)} />
-          <Kpi k="VPIN" v={fmt(latest?.vpin ?? 0, 3)} />
-          <Kpi k="EVT/S" v={fmt(latest?.events_per_sec ?? 0, 0)} />
-          <Kpi k="LAT P50" v={`${fmt(latest?.lat_p50_ns ?? 0, 0)} ns`} />
-          <Kpi k="LAT P99" v={`${fmt(latest?.lat_p99_ns ?? 0, 0)} ns`} />
-          <Kpi k="GAPS/MIN" v={fmt(latest?.gaps_last_minute ?? 0, 0)} />
-          <Kpi k="REGIME" v={REGIME_NAME[latest?.regime ?? 0]} />
-          <div className="kpi-strip">
-            <div className="kpi-strip-h">REGIME · 12s</div>
-            <div className="kpi-strip-b">
-              <RegimeStrip data={regime} />
-            </div>
-          </div>
-          <div className="kpi-actions">
-            <button onClick={() => fetch('/reset', { method: 'POST' })}>RESET BREAKER</button>
-          </div>
-        </aside>
+        <section className="ladder-wrap">
+          <div className="ladder-h">ORDER BOOK · TOP 10</div>
+          <Ladder bids={latest?.bids ?? []} asks={latest?.asks ?? []} />
+          <StageLatStrip stages={latest?.stages} />
+        </section>
       </div>
 
       <footer className="bar small">

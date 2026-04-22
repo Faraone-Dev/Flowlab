@@ -229,6 +229,16 @@ impl IchSource {
         self.symbols.get(&instrument_id).map(|s| s.as_str())
     }
 
+    /// Reverse lookup: ticker (case-insensitive, padding-trimmed) -> stock_locate.
+    /// Only finds tickers that were harvested during the fast-forward scan.
+    pub fn locate_of(&self, ticker: &str) -> Option<u32> {
+        let want = ticker.trim().to_ascii_uppercase();
+        self.symbols
+            .iter()
+            .find(|(_, s)| s.trim().eq_ignore_ascii_case(&want))
+            .map(|(id, _)| *id)
+    }
+
     /// Real-time pacing: busy-spin until wall-clock catches up to the
     /// event-time delta from the first event. Sub-microsecond budget,
     /// no syscalls in the hot path.

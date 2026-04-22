@@ -11,7 +11,6 @@ windows are pre-allocated and `O(1)`-amortized per update.
 | `imbalance.rs`       | Implemented — top-N book imbalance + depth snapshot                   |
 | `spread.rs`          | Implemented — `SpreadTracker` rolling mean + blowout ratio            |
 | `vpin.rs`            | Implemented — `VpinCalculator` with `O(1)` running sum across buckets |
-| `impact.rs`          | Implemented — `ImpactTracker` rolling per-unit price impact           |
 | `regime.rs`          | Implemented — threshold-based composite-score classifier              |
 | `circuit_breaker.rs` | Implemented — 6 guards, fail-closed latch, 7 unit tests               |
 
@@ -22,7 +21,6 @@ windows are pre-allocated and `O(1)`-amortized per update.
 | `imbalance.rs`       | `book_imbalance(book, levels) -> f64` in `[-1.0, 1.0]`       |
 | `spread.rs`          | `SpreadMetrics { current, mean, blowout_ratio }`             |
 | `vpin.rs`            | `vpin() -> f64` updated when a volume bucket completes       |
-| `impact.rs`          | `mean_impact() -> f64` price move per unit volume            |
 | `regime.rs`          | `Regime::{Calm, Volatile, Aggressive, Crisis}`               |
 | `circuit_breaker.rs` | `Decision::{Allow, Block(HaltReason)}`                       |
 

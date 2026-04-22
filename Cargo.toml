@@ -5,7 +5,6 @@ members = [
     "replay",
     "flow",
     "chaos",
-    "lab",
     "verify",
     "bench",
     "tests",
@@ -24,7 +23,6 @@ flowlab-core = { path = "core" }
 flowlab-replay = { path = "replay" }
 flowlab-flow = { path = "flow" }
 flowlab-chaos = { path = "chaos" }
-flowlab-lab = { path = "lab" }
 flowlab-verify = { path = "verify" }
 
 # shared deps

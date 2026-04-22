@@ -6,7 +6,7 @@
 #   2) flowlab-api     (Go,   HTTP + WS + static dashboard on :8080)
 #
 # The dashboard is built once (vite build) and served from the Go API
-# on the SAME origin as /stream — no Vite dev server, no ws proxy, no
+# on the SAME origin as /stream - no Vite dev server, no ws proxy, no
 # cross-port shenanigans that make Firefox throttle the tab.
 #
 # Usage:
@@ -35,7 +35,11 @@ param(
     [switch]$NoBrowser,
     [switch]$KillOnly,
     [switch]$SkipBuild,
-    [switch]$SkipDashboardBuild
+    [switch]$SkipDashboardBuild,
+
+    # Pin the engine to a specific NASDAQ ticker (e.g. 'TSLA', 'SPY') or
+    # raw stock_locate id. Empty string => engine auto-locks.
+    [string]$Symbol = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,7 +111,8 @@ function Start-Pane {
     )
     $banner = "Write-Host '=== $Title ===' -ForegroundColor Cyan"
     $full   = "$banner; $Command"
-    Start-Process -FilePath 'pwsh' -ArgumentList @(
+    $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+    Start-Process -FilePath $shell -ArgumentList @(
         '-NoExit',
         '-NoProfile',
         '-Command',
@@ -126,12 +131,14 @@ if ($Feed -eq 'engine') {
         '--book-hz',    '10',
         '--wire',       'json'
     )
+    if ($Symbol -ne '') { $engineArgs += @('--symbol', $Symbol) }
     $apiArgs = @(
         '-addr',   ":$ApiPort",
         '-feed',   'engine',
         '-engine', "127.0.0.1:$EnginePort"
     )
     $feedLabel = "NASDAQ BX ITCH 5.0 @ $([string]$Speedup)x"
+    if ($Symbol -ne '') { $feedLabel += " [pinned=$Symbol]" }
 } else {
     $engineArgs = @(
         '--source','synthetic',
@@ -158,7 +165,7 @@ Start-Pane -Title 'flowlab-engine' -Cwd $root -Command `
 
 Start-Sleep -Seconds 1
 
-Write-Host "[2/2] api+ui pane (Go, :$ApiPort) — serves dashboard/dist on /..." -ForegroundColor Green
+Write-Host "[2/2] api+ui pane (Go, :$ApiPort) - serves dashboard/dist on /..." -ForegroundColor Green
 Start-Pane -Title 'flowlab-api + dashboard' -Cwd $apiDir -Command `
     "go run .\cmd\api $($apiArgs -join ' ')"
 
@@ -166,7 +173,7 @@ $openUrl = "http://localhost:$ApiPort/"
 
 if ($Dev) {
     Start-Sleep -Seconds 2
-    Write-Host "[extra] vite dev pane (:$DashboardPort) — HMR only" -ForegroundColor Green
+    Write-Host "[extra] vite dev pane (:$DashboardPort) - HMR only" -ForegroundColor Green
     Start-Pane -Title 'flowlab-dashboard (vite dev)' -Cwd $dashDir -Command 'npm run dev'
 }
 

@@ -60,10 +60,17 @@ type Tick struct {
 	Regime          uint8          `json:"regime"`         // 0..3
 	LatP50Ns        uint64         `json:"lat_p50_ns"`
 	LatP99Ns        uint64         `json:"lat_p99_ns"`
+	LatP999Ns       uint64         `json:"lat_p999_ns"`
+	LatMaxNs        uint64         `json:"lat_max_ns"`
+	LatJitterNs     uint64         `json:"lat_jitter_ns"` // p99 - p50
+	DroppedTotal    uint64         `json:"dropped_total"`
+	UptimeMs        uint64         `json:"uptime_ms"`
 	EventsPerSec    uint64         `json:"events_per_sec"`
 	BreakerHalted   bool           `json:"breaker_halted"`
 	BreakerReason   string         `json:"breaker_reason"`
 	GapsLastMinute  uint32         `json:"gaps_last_minute"`
+	StormActive     bool           `json:"storm_active"`
+	StormKind       string         `json:"storm_kind,omitempty"`
 	Bids            []Level        `json:"bids"`
 	Asks            []Level        `json:"asks"`
 	Stages          StageLatencies `json:"stages"`
@@ -91,6 +98,7 @@ type SyntheticFeed struct {
 	halted      bool
 	reason      string
 	gaps        uint32
+	storm       *StormController // nil if no control plane wired
 }
 
 func NewSyntheticFeed(seed int64) *SyntheticFeed {
@@ -117,6 +125,19 @@ func (f *SyntheticFeed) Next() Tick {
 		f.stress = math.Min(1.0, f.stress+0.4+f.rng.Float64()*0.3)
 	}
 	f.stress *= f.stressDecay
+	// ── storm injection: force stress floor from active StormController.
+	var stormSeverity float64
+	var stormKind string
+	if f.storm != nil {
+		stormSeverity = f.storm.ActiveSeverity()
+		stormKind = f.storm.ActiveKind()
+		if stormSeverity > 0 {
+			floor := stormSeverity*0.7 + f.rng.Float64()*stormSeverity*0.3
+			if f.stress < floor {
+				f.stress = floor
+			}
+		}
+	}
 
 	// ── mid: random walk with drift proportional to imbalance.
 	imb := (f.bidDepth - f.askDepth) / (f.bidDepth + f.askDepth)
@@ -153,6 +174,43 @@ func (f *SyntheticFeed) Next() Tick {
 		eps = 1000
 	}
 
+	// ── kind-specific overrides: each storm leaves a distinct fingerprint
+	//    on the chart that matches the chaos crate's generator semantics.
+	//    Magnitudes are scaled to be VISIBLE on the dashboard given the
+	//    current baselines (depth ~1e9, mid ~1e8 ticks, p99 ~600ns).
+	if stormSeverity > 0 {
+		switch stormKind {
+		case "PhantomLiquidity":
+			// Depth oscillates ±40% of current size at ~1Hz cycle.
+			cycle := math.Sin(float64(f.seq) * 0.08)
+			oscBid := cycle * stormSeverity * 0.4 * f.bidDepth
+			oscAsk := cycle * stormSeverity * 0.4 * f.askDepth
+			f.bidDepth = clampPositive(f.bidDepth + oscBid)
+			f.askDepth = clampPositive(f.askDepth - oscAsk)
+		case "CancellationStorm":
+			// Cancel-to-trade spike: events/sec doubles+, trade velocity collapses.
+			eps *= 1.0 + stormSeverity*3.0
+			f.tradeVel = math.Max(0.05, f.tradeVel-stormSeverity*0.85)
+			f.vpin = clamp01(f.vpin + stormSeverity*0.45)
+		case "MomentumIgnition":
+			// Strong directional drift, same sign as current imbalance.
+			// 200 ticks/step at sev=1 → ~4000 ticks (0.40 USD = 40bps) over 20 steps.
+			dir := 1.0
+			if imb < 0 {
+				dir = -1.0
+			}
+			f.mid += dir * stormSeverity * 200.0
+			f.spread *= 1.0 + stormSeverity*1.5
+		case "FlashCrash":
+			// Linear downward slide: sev=1 → 400 ticks/step, ~80bps in 20 ticks.
+			f.mid -= stormSeverity * 400.0
+			f.spread *= 1.0 + stormSeverity*4.0
+		case "LatencyArbProxy":
+			// p99 tail explodes to 5-50µs range; p50 stays cold.
+			p99 += stormSeverity * 50_000
+		}
+	}
+
 	// ── regime classification (mirrors flow/src/regime.rs thresholds).
 	score := math.Max(0, f.spread/baseSpread-1.0) +
 		math.Abs(imb)*2.0 +
@@ -181,6 +239,66 @@ func (f *SyntheticFeed) Next() Tick {
 		f.reason = "FeedGap"
 	}
 
+	// ── synthesize top-10 book levels around the current mid.
+	//    Each level steps by spread/2 ticks; sizes decay outward and are
+	//    proportional to the side's total depth. Phantom storm makes the
+	//    far levels balloon (visible in the ladder).
+	halfSpread := f.spread * 0.5
+	if halfSpread < 1 {
+		halfSpread = 1
+	}
+	bidPerLevel := f.bidDepth / 10.0
+	askPerLevel := f.askDepth / 10.0
+	bids := make([]Level, 10)
+	asks := make([]Level, 10)
+	for i := 0; i < 10; i++ {
+		// price step: 1 tick from inside, then widening by halfSpread per level.
+		offset := halfSpread + float64(i)*halfSpread*0.5
+		// size decay: top of book heaviest; geometric falloff.
+		decay := math.Pow(0.85, float64(i))
+		bidQty := bidPerLevel * decay * (0.6 + 0.8*f.rng.Float64())
+		askQty := askPerLevel * decay * (0.6 + 0.8*f.rng.Float64())
+		bids[i] = Level{
+			PriceTicks: uint64(f.mid - offset),
+			Qty:        uint64(bidQty),
+			OrderCount: uint32(3 + i),
+		}
+		asks[i] = Level{
+			PriceTicks: uint64(f.mid + offset),
+			Qty:        uint64(askQty),
+			OrderCount: uint32(3 + i),
+		}
+	}
+
+	// ── synthesize trade prints for the tape.
+	//    Per-tick trade probability scales with tradeVel (baseline ~1.0).
+	//    Up to 6 prints per tick under stress; aggressor side biased by imbalance.
+	var trades []TradePrint
+	tradeP := math.Min(0.95, f.tradeVel*0.6)
+	for i := 0; i < 6 && f.rng.Float64() < tradeP; i++ {
+		var aggr int8
+		var px float64
+		// Bias: positive imbalance → buyer-aggressive (hits ask).
+		if f.rng.Float64() < 0.5+imb*0.5 {
+			aggr = 1
+			px = f.mid + halfSpread
+		} else {
+			aggr = -1
+			px = f.mid - halfSpread
+		}
+		// Lot size: most prints small, occasional larger.
+		qty := uint64(50 + f.rng.Intn(950))
+		if f.rng.Float64() < 0.05 {
+			qty *= 10
+		}
+		trades = append(trades, TradePrint{
+			TsNs:       uint64(time.Now().UnixNano()),
+			PriceTicks: uint64(px),
+			Qty:        qty,
+			Aggressor:  aggr,
+		})
+	}
+
 	return Tick{
 		TsNs:           time.Now().UnixNano(),
 		Seq:            f.seq,
@@ -198,6 +316,19 @@ func (f *SyntheticFeed) Next() Tick {
 		BreakerHalted:  f.halted,
 		BreakerReason:  f.reason,
 		GapsLastMinute: f.gaps,
+		StormActive:    stormSeverity > 0,
+		StormKind:      stormKind,
+		Bids:           bids,
+		Asks:           asks,
+		Trades:         trades,
+		Stages: StageLatencies{
+			// Per-stage budget (rough split): parse 15%, apply 25%, analytics 30%, risk 10%, wire 20%.
+			Parse:     StageLat{P50Ns: uint64(p50 * 0.15), P99Ns: uint64(p99 * 0.15)},
+			Apply:     StageLat{P50Ns: uint64(p50 * 0.25), P99Ns: uint64(p99 * 0.25)},
+			Analytics: StageLat{P50Ns: uint64(p50 * 0.30), P99Ns: uint64(p99 * 0.30)},
+			Risk:      StageLat{P50Ns: uint64(p50 * 0.10), P99Ns: uint64(p99 * 0.10)},
+			Wire:      StageLat{P50Ns: uint64(p50 * 0.20), P99Ns: uint64(p99 * 0.20)},
+		},
 	}
 }
 

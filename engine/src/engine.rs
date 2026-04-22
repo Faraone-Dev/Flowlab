@@ -127,7 +127,11 @@ impl Default for EngineConfig {
             tick_publish_hz: 50,
             book_publish_hz: 10,
             depth_levels: 10,
-            vpin_bucket: 1_000,
+            // VPIN bucket sizing: TSLA-class names print ~50-200 share
+            // averages. 10k shares -> ~5-15s per bucket which lets the
+            // 50-bucket rolling window swing 0.0..0.8 between balanced
+            // and toxic minutes once aggressor classification is honest.
+            vpin_bucket: 10_000,
             vpin_buckets: 50,
             spread_window: 256,
         }
@@ -155,11 +159,24 @@ pub struct Engine {
     wire_stats: StageStats,
     histo: ApplyHisto,
 
+    /// Sub-ns hot-path clock. Calibrated once in `new()`. `Instant::now()`
+    /// on Windows clips at the QPC tick (~100-200 ns) which makes
+    /// `OrderBook::apply` (sub-100 ns) read as a flat floor on the
+    /// dashboard. `rdtsc` reads the invariant TSC at ~25 cycles.
+    tsc: crate::tsc::TscClock,
+
     last_vpin: f64,
     last_imbalance: f64,
     /// Rolling-window blowout ratio from `SpreadTracker::record`. 0.0
     /// until the window is warm. Fed to the regime classifier.
     last_blowout_ratio: f64,
+    /// Mid price (in ticks) seen at the previous 1s regime tick.
+    /// Used to compute mid drift (bps/s) which drives the regime
+    /// classifier's directional-move component.
+    prev_mid_ticks: i64,
+    /// |Δmid|/mid in bps over the last 1s window. Updated alongside
+    /// `last_eps` and consumed by the composite regime score.
+    last_mid_drift_bps: f64,
     /// EWMA of trade velocity used as the baseline for
     /// `trade_velocity_ratio = current / baseline`. Seeded on the first
     /// non-zero sample so startup doesn't classify CALM as CRISIS.
@@ -208,14 +225,28 @@ impl Engine {
             breaker,
             regime,
             started: Instant::now(),
-            apply_stats: StageStats::new(8192),
-            analytics_stats: StageStats::new(8192),
-            risk_stats: StageStats::new(8192),
-            wire_stats: StageStats::new(8192),
+            // 256-sample rolling window: at 1k-10k evt/s this gives a
+            // ~25-250 ms window so the dashboard sees real jitter
+            // tick-by-tick instead of an over-smoothed flatline.
+            apply_stats: StageStats::new(256),
+            analytics_stats: StageStats::new(256),
+            risk_stats: StageStats::new(256),
+            wire_stats: StageStats::new(256),
             histo: ApplyHisto::new(),
+            tsc: {
+                let c = crate::tsc::TscClock::calibrate();
+                tracing::info!(
+                    cycles_per_ns = format!("{:.3}", c.cycles_per_ns()),
+                    overhead_cycles = c.overhead_cycles(),
+                    "TSC clock calibrated"
+                );
+                c
+            },
             last_vpin: 0.0,
             last_imbalance: 0.0,
             last_blowout_ratio: 0.0,
+            prev_mid_ticks: 0,
+            last_mid_drift_bps: 0.0,
             trade_velocity_baseline: 0.0,
             seq: 0,
             tracked,
@@ -277,8 +308,13 @@ impl Engine {
             // trade in 5s wall-clock (~250s replay at 50x), drop the lock
             // and let the next active name take over. Keeps the desk live
             // when a thin ETN goes quiet mid-session.
+            //
+            // ⚠ Skip re-arm when the symbol was pinned via CLI
+            // (`--symbol XYZ`). The operator explicitly chose that name;
+            // silently switching to another ticker mid-demo would be a
+            // worse failure than a quiet 10s.
             if let (Some(_), Some(last)) = (self.tracked, self.last_locked_trade_at) {
-                if last.elapsed() > Duration::from_secs(5) {
+                if self.cfg.track_instrument.is_none() && last.elapsed() > Duration::from_secs(5) {
                     tracing::info!("locked symbol stale > 5s — re-arming auto-lock");
                     self.tracked = None;
                     self.last_locked_trade_at = None;
@@ -353,7 +389,18 @@ impl Engine {
                 if price == 0 {
                     None
                 } else {
-                    let aggressor = if ba > 0 && price >= ba {
+                    // Lee-Ready aggressor classification, but ONLY when
+                    // the book is sane (ba > bb). On a crossed/locked
+                    // top (which happens on BX during stale updates and
+                    // ITCH gap recovery) `price >= ba` AND `price <= bb`
+                    // are both true, so the naive `if` would tag every
+                    // trade as a buy and saturate VPIN at 1.0. Treat
+                    // crossed/locked as "unknown side" -> 0 (VPIN will
+                    // split 50/50).
+                    let crossed = bb > 0 && ba > 0 && bb >= ba;
+                    let aggressor = if crossed {
+                        0i8
+                    } else if ba > 0 && price >= ba {
                         1i8
                     } else if bb > 0 && price <= bb {
                         -1i8
@@ -367,17 +414,25 @@ impl Engine {
             };
 
             // ── apply (stage = apply)
-            let t0 = Instant::now();
+            let t0 = crate::tsc::rdtsc();
             let _changed = self.book.apply(&ev);
-            let apply_ns = t0.elapsed().as_nanos() as u64;
+            let apply_ns = self.tsc.delta_ns(t0, crate::tsc::rdtsc());
             self.apply_stats.push(apply_ns);
             self.histo.record(apply_ns);
 
             // ── analytics (only on trades / on imbalance refresh)
-            let t1 = Instant::now();
+            let t1 = crate::tsc::rdtsc();
             if ev.event_type == EventType::Trade as u8 {
                 self.trades_in_window += 1;
-                if let Some(v) = self.vpin.process_trade(&ev) {
+                // Use the Lee-Ready aggressor sign computed above when
+                // available (price-vs-NBBO classification). Falling back
+                // to ev.side here would feed VPIN with the resting-order
+                // side, which on ITCH 'P' messages saturates the metric.
+                if let Some((_, qty, _, aggr)) = trade_info {
+                    if let Some(v) = self.vpin.process_trade_signed(qty, aggr) {
+                        self.last_vpin = v;
+                    }
+                } else if let Some(v) = self.vpin.process_trade(&ev) {
                     self.last_vpin = v;
                 }
             }
@@ -385,14 +440,14 @@ impl Engine {
             if let Some(sm) = self.spread.record(&self.book) {
                 self.last_blowout_ratio = sm.blowout_ratio;
             }
-            self.analytics_stats.push(t1.elapsed().as_nanos() as u64);
+            self.analytics_stats.push(self.tsc.delta_ns(t1, crate::tsc::rdtsc()));
 
             // ── risk: probe with a zero-quantity intent — exercises every guard
             // without polluting position. Real intents are pushed by the
             // strategy crate; here we just sample the breaker latency.
-            let t2 = Instant::now();
+            let t2 = crate::tsc::rdtsc();
             // No probe call yet — keeps risk_stats honest as "no-op overhead".
-            self.risk_stats.push(t2.elapsed().as_nanos() as u64);
+            self.risk_stats.push(self.tsc.delta_ns(t2, crate::tsc::rdtsc()));
 
             // ── publish Trade frame (after apply, so downstream can
             //    correlate with the resulting mid)
@@ -424,21 +479,92 @@ impl Engine {
                 }
                 let bb = self.book.best_bid().unwrap_or(0);
                 let ba = self.book.best_ask().unwrap_or(0);
+                // Compute |Δmid|/mid (bps) over this 1s window. Accept
+                // both regular (ba > bb) and crossed/locked (ba <= bb)
+                // tops -- on BX the crossed state can persist for tens
+                // of seconds and we still want to track price drift.
+                let cur_mid = if bb > 0 && ba > 0 { ((bb + ba) / 2) as i64 } else { 0 };
+                if cur_mid > 0 && self.prev_mid_ticks > 0 {
+                    let d = (cur_mid - self.prev_mid_ticks).abs() as f64;
+                    self.last_mid_drift_bps = (d / cur_mid as f64) * 10_000.0;
+                } else {
+                    self.last_mid_drift_bps = 0.0;
+                }
+                if cur_mid > 0 {
+                    self.prev_mid_ticks = cur_mid;
+                }
                 let sym = self
                     .tracked
                     .and_then(|id| source.symbol_of(id).map(str::to_string))
                     .unwrap_or_else(|| "<none>".into());
-                tracing::debug!(
-                    tracked = ?self.tracked,
+                // ── REGIME diagnostic: show every component, the composite
+                //    score, and the resulting label so we can see exactly
+                //    why we are (or are not) escalating to CRISIS.
+                //
+                // Weights (rebalanced so the regime *oscillates* across
+                // all four levels instead of being pinned at AGGRESSIVE
+                // by VPIN baseline alone):
+                //   spread_blowout - 1   × 1.0   (1.5x = +0.5)
+                //   |imbalance|          × 3.0   (0.30 = +0.9)
+                //   vpin                 × 5.0   (0.25 baseline = +1.25)
+                //   |vel_ratio - 1|      × 0.6   (2x or 0.5x = +0.6)
+                //   mid_drift_bps        × 0.30  (10 bps/s = +3.0 → CRISIS)
+                let vel_ratio = if self.trade_velocity_baseline > 0.0 {
+                    self.last_trade_vel / self.trade_velocity_baseline
+                } else {
+                    1.0
+                };
+                let s_spread = (self.last_blowout_ratio - 1.0).max(0.0);
+                let s_imb_raw = self.last_imbalance.abs() * 3.0;
+                let s_vpin = self.last_vpin * 5.0;
+                let s_vel = (vel_ratio - 1.0).abs() * 0.6;
+                let s_drift = self.last_mid_drift_bps * 0.30;
+                // ── Crossed-book guard: when bid >= ask the topline is
+                //    inverted (common on inferior-quote venues like BX
+                //    where local best is below NBBO). In that state both
+                //    `imbalance` and `blowout` are computed against a
+                //    nonsensical book and saturate near ±1 / huge values.
+                //    Suppress them; trust only vpin / vel / drift.
+                let crossed_top = bb > 0 && ba > 0 && bb >= ba;
+                let (s_imb, s_spread_eff) = if crossed_top {
+                    (0.0, 0.0)
+                } else {
+                    (s_imb_raw, s_spread)
+                };
+                let raw_score = s_spread_eff + s_imb + s_vpin + s_vel + s_drift;
+                // ── Freshness dampener: when the tape is dead (eps<30)
+                //    the topline of the book gets stale (top quote pulled,
+                //    next level is deep) → spread/imbalance become
+                //    artifacts, not real stress. Linearly fade the score
+                //    toward 0 as eps drops below the threshold so a
+                //    sparse symbol can't permanently shout CRISIS.
+                let freshness = ((self.last_eps as f64) / 30.0).min(1.0);
+                let score = raw_score * freshness;
+                let regime_lbl = if score >= 3.0 {
+                    "CRISIS"
+                } else if score >= 1.5 {
+                    "AGGRESSIVE"
+                } else if score >= 0.6 {
+                    "VOLATILE"
+                } else {
+                    "CALM"
+                };
+                tracing::info!(
+                    target: "regime",
                     sym = %sym,
                     eps = self.last_eps,
                     trd_per_s = format!("{:.1}", self.last_trade_vel),
-                    bb_ticks = bb,
-                    ba_ticks = ba,
+                    bb = bb,
+                    ba = ba,
+                    crossed = crossed_top,
+                    blowout = format!("{:.2}", self.last_blowout_ratio),
                     imb = format!("{:.3}", self.last_imbalance),
                     vpin = format!("{:.3}", self.last_vpin),
-                    seen_syms = self.instrument_counts.len(),
-                    "1s tick"
+                    vel_ratio = format!("{:.2}", vel_ratio),
+                    drift_bps = format!("{:.2}", self.last_mid_drift_bps),
+                    fresh = format!("{:.2}", freshness),
+                    "scores: spread={:.2} imb={:.2} vpin={:.2} vel={:.2} drift={:.2} | RAW={:.2} *fresh={:.2} = TOT={:.2} -> {}",
+                    s_spread_eff, s_imb, s_vpin, s_vel, s_drift, raw_score, freshness, score, regime_lbl
                 );
                 self.events_in_window = 0;
                 self.trades_in_window = 0;
@@ -448,13 +574,13 @@ impl Engine {
 
             if now >= next_tick {
                 let frame = self.build_tick(&ev, out.dropped_total());
-                let t3 = Instant::now();
+                let t3 = crate::tsc::rdtsc();
                 // Skip the tick if the book isn't yet two-sided — emitting
                 // mid=0 pollutes the MID spark and ruins the scale.
                 if frame.mid_ticks > 0 {
                     out.try_send(TelemetryFrame::Tick(frame));
                 }
-                self.wire_stats.push(t3.elapsed().as_nanos() as u64);
+                self.wire_stats.push(self.tsc.delta_ns(t3, crate::tsc::rdtsc()));
 
                 // also publish risk + lat at the tick cadence
                 out.try_send(TelemetryFrame::Risk(self.build_risk()));
@@ -505,12 +631,19 @@ impl Engine {
         } else {
             1.0
         };
+        // Same crossed-book guard the engine's debug log uses,
+        // mirrored down to the flow-crate classifier so the
+        // dashboard's REGIME label matches the log line.
+        let book_crossed = best_bid > 0 && best_ask > 0 && best_bid >= best_ask;
         let regime_input = RegimeInput {
             spread_blowout_ratio: self.last_blowout_ratio,
             book_imbalance: self.last_imbalance,
             vpin: self.last_vpin,
             trade_velocity_ratio: velocity_ratio,
             depth_depletion: 0.0,
+            mid_drift_bps: self.last_mid_drift_bps,
+            events_per_sec: self.last_eps,
+            book_crossed,
         };
         let regime: u8 = match self.regime.classify(&regime_input) {
             Regime::Calm => 0,

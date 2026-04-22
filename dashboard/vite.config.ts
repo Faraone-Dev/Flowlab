@@ -13,7 +13,10 @@ export default defineConfig({
       },
       '/health': 'http://localhost:8080',
       '/status': 'http://localhost:8080',
-      '/reset': 'http://localhost:8080',
+      '/reset':  'http://localhost:8080',
+      '/storm':  'http://localhost:8080',
+      '/run':    'http://localhost:8080',
+      '/bot':    'http://localhost:8080',
     },
   },
 });

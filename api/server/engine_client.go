@@ -311,6 +311,7 @@ func (c *EngineClient) dispatchJSON(payload []byte) {
 				Regime:          et.Regime,
 				LatP50Ns:        lat, // placeholder until Lat decoded
 				LatP99Ns:        lat, // ditto
+				DroppedTotal:    et.DroppedTotal,
 				EventsPerSec:    et.EventsPerSec,
 				BreakerHalted:   halted,
 				BreakerReason:   reason,
@@ -336,6 +337,11 @@ func (c *EngineClient) dispatchJSON(payload []byte) {
 					patched := *last
 					patched.LatP50Ns = el.Apply.P50Ns
 					patched.LatP99Ns = el.Apply.P99Ns
+					patched.LatP999Ns = el.Apply.P999Ns
+					patched.LatMaxNs = el.Apply.MaxNs
+					if el.Apply.P99Ns > el.Apply.P50Ns {
+						patched.LatJitterNs = el.Apply.P99Ns - el.Apply.P50Ns
+					}
 					patched.Stages = stages
 					c.latest.Store(&patched)
 				}

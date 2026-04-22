@@ -66,10 +66,12 @@ struct Cli {
     #[arg(long, default_value_t = 8192)]
     capacity: usize,
 
-    /// Pin the engine to a specific ITCH stock_locate (1-based). If omitted,
-    /// the engine auto-locks to the first liquid ticker in the feed.
+    /// Pin the engine to a specific symbol. Accepts either a NASDAQ
+    /// ticker (e.g. "TSLA", "SPY", "AAPL") or a raw stock_locate id
+    /// (e.g. "8244"). If omitted, the engine auto-locks to the first
+    /// liquid ticker in the feed.
     #[arg(long)]
-    symbol: Option<u32>,
+    symbol: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,8 +96,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Build the Source.
+    let mut tracked: Option<u32> = None;
     let mut source: Box<dyn Source> = match cli.source.as_str() {
-        "synthetic" => Box::new(SyntheticSource::new(cli.seed)),
+        "synthetic" => {
+            tracked = cli.symbol.as_deref().and_then(|s| s.parse::<u32>().ok());
+            Box::new(SyntheticSource::new(cli.seed))
+        }
         "ich" => {
             if cli.source_arg.is_empty() {
                 return Err("--source ich requires --source-arg <path-to-itch-file>".into());
@@ -125,6 +131,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ?framing,
                 "ITCH source opened"
             );
+            // Resolve --symbol against the harvested Stock Directory:
+            // accept either a numeric stock_locate or a ticker string.
+            if let Some(req) = cli.symbol.as_deref() {
+                let resolved = req
+                    .parse::<u32>()
+                    .ok()
+                    .or_else(|| s.locate_of(req));
+                match resolved {
+                    Some(id) => {
+                        let sym = s.symbol_of(id).unwrap_or("<unknown>");
+                        info!(requested = %req, locate = id, ticker = sym, "symbol locked from CLI");
+                        tracked = Some(id);
+                    }
+                    None => {
+                        return Err(format!(
+                            "--symbol {req}: ticker not found in Stock Directory (try a top-of-day liquid name like SPY, AAPL, TSLA, QQQ)"
+                        )
+                        .into());
+                    }
+                }
+            }
             Box::new(s)
         }
         "binance" => unimplemented!("BinanceSource lands in the step after ich"),
@@ -150,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EngineConfig {
         tick_publish_hz: cli.tick_hz,
         book_publish_hz: cli.book_hz,
-        track_instrument: cli.symbol,
+        track_instrument: tracked,
         ..Default::default()
     };
     let engine = Engine::new(cfg);

@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/ladder.tsx","./src/regimestrip.tsx","./src/spark.tsx","./src/tradetape.tsx","./src/main.tsx","./src/types.ts","./src/usestream.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/botpanel.tsx","./src/ladder.tsx","./src/regimestrip.tsx","./src/runpanel.tsx","./src/spark.tsx","./src/stormpanel.tsx","./src/tradetape.tsx","./src/main.tsx","./src/types.ts","./src/usestream.ts"],"version":"5.9.3"}

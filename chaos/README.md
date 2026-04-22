@@ -43,9 +43,9 @@ sequence windows are enabled.
 ## ChaosChain
 
 `ChaosChain` is the single integration point for downstream consumers
-(`flowlab-lab::executor::StrategyExecutor::with_chaos_chain`,
-`bench/chaos_throughput`). It owns one instance of each detector and
-fans every event out in this fixed order:
+(`bench/chaos_throughput`, future detector pipelines). It owns one
+instance of each detector and fans every event out in this fixed
+order:
 
 1. PhantomLiquidity
 2. CancellationStorm
@@ -258,8 +258,8 @@ pub enum ChaosKind {
 ```
 
 The reserved variants are first-class in the type system so that
-clustering, windowing and downstream `flowlab-lab` consumers compile
-against the final shape today and only require new detectors landing
+clustering, windowing and downstream consumers compile against the
+final shape today and only require new detectors landing
 incrementally.
 
 ## QuoteStuffDetector

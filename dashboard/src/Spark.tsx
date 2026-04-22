@@ -19,6 +19,9 @@ export interface SparkProps {
   /** Optional fixed vertical range. If provided, data is scaled into it. */
   min?: number;
   max?: number;
+  /** Use log10 Y scale. Great for latencies where p99 >> p50 and we
+   *  want to see micro-jitter on both lines simultaneously. */
+  logY?: boolean;
 }
 
 export function Spark(props: SparkProps) {
@@ -45,24 +48,25 @@ export function Spark(props: SparkProps) {
       if (n < 2 || w === 0 || h === 0) return;
 
       // find data range across both series when data2 is present
-      let dmin = p.min ?? Infinity;
-      let dmax = p.max ?? -Infinity;
+      const tx = (v: number) => (p.logY ? Math.log10(Math.max(1, v)) : v);
+      let dmin = p.min !== undefined ? tx(p.min) : Infinity;
+      let dmax = p.max !== undefined ? tx(p.max) : -Infinity;
       if (p.min === undefined || p.max === undefined) {
         for (let i = 0; i < n; i++) {
-          const v = data[i];
+          const v = tx(data[i]);
           if (p.min === undefined && v < dmin) dmin = v;
           if (p.max === undefined && v > dmax) dmax = v;
         }
         if (data2) {
           const m = data2.length;
           for (let i = 0; i < m; i++) {
-            const v = data2[i];
+            const v = tx(data2[i]);
             if (p.min === undefined && v < dmin) dmin = v;
             if (p.max === undefined && v > dmax) dmax = v;
           }
         }
       }
-      if (p.positiveOnly && dmin > 0) dmin = 0;
+      if (p.positiveOnly && !p.logY && dmin > 0) dmin = 0;
       if (dmin === dmax) {
         dmin -= 1;
         dmax += 1;
@@ -81,7 +85,7 @@ export function Spark(props: SparkProps) {
       const xFor = (i: number, len: number) =>
         padL + (len === 1 ? plotW / 2 : (i / (len - 1)) * plotW);
       const yFor = (v: number) =>
-        padT + plotH - ((v - dmin) / (dmax - dmin)) * plotH;
+        padT + plotH - ((tx(v) - dmin) / (dmax - dmin)) * plotH;
 
       // faint midline
       ctx.strokeStyle = 'rgba(90,90,90,0.18)';

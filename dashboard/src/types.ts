@@ -42,6 +42,10 @@ export interface Tick {
   regime: 0 | 1 | 2 | 3;
   lat_p50_ns: number;
   lat_p99_ns: number;
+  lat_p999_ns?: number;
+  lat_max_ns?: number;
+  lat_jitter_ns?: number;
+  dropped_total?: number;
   events_per_sec: number;
   breaker_halted: boolean;
   breaker_reason: string;

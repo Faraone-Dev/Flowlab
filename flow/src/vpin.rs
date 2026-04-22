@@ -28,22 +28,54 @@ impl VpinCalculator {
     }
 
     /// Process a trade event. Returns updated VPIN if a bucket completed.
+    ///
+    /// Uses the raw `event.side` field. For NASDAQ ITCH `'P'` messages
+    /// this is the side of the *resting non-displayed order*, NOT the
+    /// aggressor, so VPIN computed this way saturates near 1.0 in
+    /// directional minutes. Prefer `process_trade_signed` from
+    /// engine code that has already classified the aggressor with the
+    /// quote rule (price vs best bid/ask).
     pub fn process_trade(&mut self, event: &Event) -> Option<f64> {
         if EventType::from_u8(event.event_type) != Some(EventType::Trade) {
             return None;
         }
-
-        // Classify by aggressor side
-        match Side::from_u8(event.side) {
-            Some(Side::Bid) => self.current_buy_vol += event.qty,
-            Some(Side::Ask) => self.current_sell_vol += event.qty,
+        let signed = match Side::from_u8(event.side) {
+            Some(Side::Bid) => 1i8,
+            Some(Side::Ask) => -1i8,
             None => return None,
+        };
+        self.process_signed(event.qty, signed)
+    }
+
+    /// Process a trade with an externally-computed aggressor sign:
+    ///   `+1` = buy-initiated (price >= best_ask)
+    ///   `-1` = sell-initiated (price <= best_bid)
+    ///    `0` = inside spread / unknown -> split 50/50
+    pub fn process_trade_signed(&mut self, qty: u64, aggressor: i8) -> Option<f64> {
+        self.process_signed(qty, aggressor)
+    }
+
+    fn process_signed(&mut self, qty: u64, aggressor: i8) -> Option<f64> {
+        if qty == 0 {
+            return None;
+        }
+        match aggressor {
+            1 => self.current_buy_vol += qty,
+            -1 => self.current_sell_vol += qty,
+            _ => {
+                // Inside spread: split the print evenly so the bucket
+                // doesn't end up biased by an unsignable trade.
+                let half = qty / 2;
+                self.current_buy_vol += half;
+                self.current_sell_vol += qty - half;
+            }
         }
 
-        self.current_bucket_vol += event.qty;
+        self.current_bucket_vol += qty;
 
         if self.current_bucket_vol >= self.bucket_size {
-            let new_diff = (self.current_buy_vol as f64 - self.current_sell_vol as f64).abs();
+            let new_diff =
+                (self.current_buy_vol as f64 - self.current_sell_vol as f64).abs();
 
             // Evict oldest bucket — O(1) pop_front
             if self.buckets.len() >= self.num_buckets {

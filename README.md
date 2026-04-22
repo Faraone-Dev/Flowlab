@@ -1,23 +1,25 @@
 # FLOWLAB
 
-**Deterministic Multi-Language HFT Replay & Microstructure Research System**
+**Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
-Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go ingest &nbsp;|&nbsp;
-83 tests (71 Rust + 12 Zig) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
+Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go control plane &nbsp;|&nbsp;
+134 tests (122 Rust + 12 Zig) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
 MoldUDP64 + WAL + SPSC mmap ring &nbsp;|&nbsp; Rust↔Zig↔C++ canonical L2 hash bit-identical &nbsp;|&nbsp;
 6-guard fail-closed risk gate &nbsp;|&nbsp;
-Live React/uPlot dashboard fed by a real Rust runtime over a versioned
-TCP wire — see [`engine/`](engine/) and [`dashboard/`](dashboard/).
+React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
+recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
+[`dashboard/`](dashboard/), [`api/`](api/) and [`engine/`](engine/).
 
 Multi-language pipeline for market-data replay, microstructure analytics,
-HFT aggression detection, and strategy simulation under controlled stress.
-Same input bytes produce identical state, byte-for-byte, across runs and
-platforms.
+HFT aggression detection, and **adversarial bot stress-testing** under
+controlled storm conditions. Same input bytes produce identical state,
+byte-for-byte, across runs and platforms.
 
 > Research and simulation framework. Not a trading system.
 >
 > **Modeled:** deterministic order flow replay, microstructure analytics,
-> chaos pattern detection, strategy harness against a replayed book.
+> chaos pattern detection, live adversarial storms against a third-party
+> trading bot (TARGET), audit-grade run recording.
 > **Not modeled:** market impact, queue position, fill probability,
 > exchange matching, latency arbitrage outcomes, real PnL.
 
@@ -63,16 +65,16 @@ coerente può essere costruito; non finge di essere quel layer.
 
 ## Language responsibilities
 
-The project is **Rust-core**: ~70% of the code (and the entire
+The project is **Rust-core**: ~80% of the code (and the entire
 deterministic state machine, replay, WAL, risk gate, analytics) is
 Rust. The other languages are scoped specializations.
 
-| Concern        | Language | Scope                                              | LOC |
-| -------------- | -------- | -------------------------------------------------- | --- |
-| Truth          | Rust     | Event ABI, state machine, replay, WAL, analytics   | ~7,400 |
-| Specialization | Zig 0.13 | `comptime` ITCH 5.0 parser, zero-copy              | ~480 |
-| Speed (opt-in) | C++20    | L2 book + Welford stats behind `--features native` | ~330 |
-| I/O            | Go       | mmap ring writer + WebSocket ingest + control API  | ~430 |
+| Concern        | Language | Scope                                              | LOC     |
+| -------------- | -------- | -------------------------------------------------- | ------- |
+| Truth          | Rust     | Event ABI, state machine, replay, WAL, analytics   | ~14,600 |
+| Specialization | Zig 0.13 | `comptime` ITCH 5.0 parser, zero-copy              | ~480    |
+| Speed (opt-in) | C++20    | L2 book + Welford stats behind `--features native` | ~500    |
+| I/O + control  | Go       | mmap ring writer, WS ingest, control plane + CHAOS | ~2,200  |
 
 Go **never** participates in replay. C++ and Zig never touch the
 network. The deterministic core has no runtime dependency on either
@@ -101,7 +103,6 @@ GC or syscalls beyond `read` / `mmap`.
 │        ├── replay engine (flowlab-replay)                         │
 │        ├── microstructure analytics + risk gate (flowlab-flow)   │
 │        ├── HFT aggression detection (flowlab-chaos)               │
-│        ├── strategy sandbox (flowlab-lab)                         │
 │        └── state verifier (flowlab-verify)                        │
 │                                                                   │
 │  C++ hot path (hotpath/)  ←  FFI  ──  book, hasher, stats        │
@@ -184,6 +185,182 @@ cd ../dashboard && npm install && npm run dev   # http://localhost:5173
 
 `-feed=synthetic` keeps the legacy in-process Go feed for offline
 dashboard hacking. The dashboard contract is unchanged across modes.
+
+### Run modes (production vs UI dev)
+
+The dashboard ships in **two modes**, and they are not the same thing.
+For demos and stress runs use single-origin; for UI work use Vite dev.
+
+| Mode                | Command                                    | Origins                                  | When to use                                       |
+| ------------------- | ------------------------------------------ | ---------------------------------------- | ------------------------------------------------- |
+| **Single-origin**   | `.\run-desk.ps1`                           | `:8080` only — Go serves `dashboard/dist/` + WS + control plane | Default. Demos, recorded runs, day-to-day driving the desk. No CORS, no WS proxy fragility, Firefox does not throttle. |
+| **UI dev (HMR)**    | `.\run-desk.ps1 -Dev` (or `npm run dev`)   | `:5173` (Vite UI) → proxies `/stream` `/storm` `/run` `/bot` `/health` `/status` `/reset` to `:8080` | Only when modifying React components. Hot-module-reload, source maps, React DevTools. |
+
+The Go process always owns `:8080` (WS + REST + recorder). Vite never
+talks to the Rust engine directly. In production there is no Node
+runtime at all — the React bundle is just static files served by Go.
+
+
+---
+
+## Adversarial desk
+
+The dashboard is also a **stress-testing console** against a real
+external trading bot (the *target*). Five chaos kinds can be fired
+into the synthetic feed live, with full auditability: every run
+produces a deterministic 3-file artefact set on disk.
+
+```
+                      ┌─────────────────────────────────┐
+                      │   CHAOS DECK (left aside)       │
+                      │  PHANTOM · CANCEL · IGNITION    │
+                      │  CRASH   · LAT-ARB              │
+                      │                                 │
+                      │  severity ∈ [0,1]               │
+                      │  duration ∈ [5s, 120s]          │
+                      └────────────┬────────────────────┘
+                                   │ POST /storm/start
+                                   ▼
+        ┌─────────────────────────────────────────────────┐
+        │  StormController (api/server/storm.go)          │
+        │  + per-kind injectors in feed.go                │
+        │    • PhantomLiquidity → ±40% depth oscillation  │
+        │    • CancellationStorm → 4× EPS, VPIN ↑, vel ↓  │
+        │    • MomentumIgnition → directional drift on imb│
+        │    • FlashCrash → mid slide + spread blowout    │
+        │    • LatencyArbProxy → p99 tail explosion       │
+        └────────────┬────────────────────────────────────┘
+                     │ corrupted Ticks broadcast on /stream
+                     ▼
+        ┌─────────────────────────────────────────────────┐
+        │  TARGET (external HFT bot, e.g. ZEUS-HFT)       │
+        │  reads its own venue feed (cTrader demo)        │
+        │  exposes /api/state with equity / pnl / signals │
+        └────────────┬────────────────────────────────────┘
+                     │ polled by Recorder + BotPanel
+                     ▼
+        ┌─────────────────────────────────────────────────┐
+        │  Recorder (api/server/recorder.go)              │
+        │    data/runs/<UTC-id>/                          │
+        │      ├─ run.yaml      desk-grade summary        │
+        │      ├─ events.jsonl  storm + signal events     │
+        │      └─ ticks.jsonl   1Hz sampled microstructure│
+        └─────────────────────────────────────────────────┘
+```
+
+### Storm kinds
+
+| Button     | Kind                | Effect on the synthetic tick                        |
+| ---------- | ------------------- | --------------------------------------------------- |
+| `PHANTOM`  | `PhantomLiquidity`  | Depth oscillates ±40% at ~1Hz (visible book churn)  |
+| `CANCEL`   | `CancellationStorm` | EPS up to 4×, VPIN climbs, trade velocity collapses |
+| `IGNITION` | `MomentumIgnition`  | Directional mid drift (sign = current imbalance)    |
+| `CRASH`    | `FlashCrash`        | Linear mid slide + spread blowout                   |
+| `LAT-ARB`  | `LatencyArbProxy`   | P99 tail latency explodes; P50 stays cold           |
+
+Severity (0..1) and duration (5s..120s) are operator-controlled. The
+storm ends deterministically; the breaker latches if regime escalates
+to `Crisis` and gaps accumulate.
+
+### Run artefacts
+
+`run.yaml` is the desk's scoreboard. Self-contained, hand-rolled YAML
+(no dep), with verdict computed from `target.delta`:
+
+```yaml
+run_id: 2026-04-22T17-50-18Z
+started_at: 2026-04-22T17:50:18Z
+ended_at:   2026-04-22T17:50:31Z
+duration_s: 13
+tick_samples: 14
+storms_fired:
+  - kind: FlashCrash
+    started_at_ms: 1776876627753
+    severity: 0.850
+    duration_ms: 3000
+    target_pnl_delta_eur: -2.40
+target:
+  bot: zeus-hft
+  currency: EUR
+  start_equity: 99712.73
+  end_equity:   99710.33
+  delta:        -2.40
+  total_trades: 4
+  wins: 1
+  losses: 3
+  win_rate: 0.250
+verdict: TARGET_INTACT     # TARGET_INTACT | TARGET_DAMAGED (<-10) | TARGET_KILLED (<-100)
+```
+
+`events.jsonl` is the audit trail (`run_start`, `storm_start`,
+`storm_stop`, `target_signal`, `run_stop`). `ticks.jsonl` is a 1 Hz
+sample of the full microstructure tick (mid, depth, VPIN, latency,
+regime, storm_active, storm_kind) for offline analysis.
+
+### Control plane endpoints
+
+| Method | Path              | Purpose                                     |
+| ------ | ----------------- | ------------------------------------------- |
+| `POST` | `/storm/start`    | Fire one of 5 storm kinds                   |
+| `POST` | `/storm/stop`     | Cancel active storm                         |
+| `GET`  | `/storm/status`   | `{mode, kind?, severity, expires_at_ms?}`   |
+| `POST` | `/run/start`      | Open a new recorded run directory           |
+| `POST` | `/run/stop`       | Finalize `run.yaml`, close JSONL files      |
+| `GET`  | `/run/status`     | Currently active run (if any)               |
+| `GET`  | `/run/list`       | All runs on disk                            |
+| `GET`  | `/run/{id}/yaml`  | Stream a finished `run.yaml`                |
+| `GET`  | `/bot/state`      | Reverse-proxy to TARGET's `/api/state`      |
+| `GET`  | `/bot/health`     | Reverse-proxy to TARGET's `/api/health`     |
+
+The dashboard's CHAOS DECK + SCOREBOARD + TARGET panels are thin
+clients over these endpoints. Every storm fired and every tick
+sampled during an active run lands on disk before the WebSocket frame
+leaves the bridge.
+
+### Connecting a bot (TARGET adapter)
+
+The bench is **bot-agnostic**. Any external trading bot becomes the
+`TARGET` by exposing two HTTP endpoints on `127.0.0.1:3001` (default
+— configurable via `botHealthURL` in [api/server/server.go](api/server/server.go)):
+
+| Method | Path           | Required response                                                              |
+| ------ | -------------- | ------------------------------------------------------------------------------ |
+| `GET`  | `/api/health`  | `200 OK` with any body. Used for liveness only.                                |
+| `GET`  | `/api/state`   | JSON object with at least: `equity` (number, base currency), `currency` (3-letter ISO), `total_trades`, `wins`, `losses`. Optional: `realized_pnl`, `unrealized_pnl`, `signals` (array). |
+
+Minimal `/api/state` body the recorder understands:
+
+```json
+{
+  "bot": "my-hft-bot",
+  "currency": "EUR",
+  "equity": 99710.33,
+  "realized_pnl": -1.60,
+  "unrealized_pnl": 0.00,
+  "total_trades": 4,
+  "wins": 1,
+  "losses": 3
+}
+```
+
+The connection model is **pull, not push**:
+
+1. The bot keeps its own venue connection (e.g. ZEUS-HFT \u2192 cTrader
+   FIX on demo). flowlab does **not** route orders or feed data into
+   the bot.
+2. flowlab polls `/api/state` every \u22481 s for the BotPanel and twice
+   per recorded run (start + stop) for `run.yaml`'s `target.delta`.
+3. The CHAOS storms reshape the **synthetic feed on `/stream`**, not
+   the bot's venue feed. The bot is stressed indirectly: if it
+   subscribes to flowlab's `/stream`, it sees corrupted ticks; if it
+   trades on its own venue, the bench measures whether the bot's
+   internal regime detection / risk gate noticed the external storm.
+
+This pull model is intentional: it lets flowlab benchmark **any**
+bot \u2014 Python, C++, Go, closed-source binaries \u2014 as long as it can
+expose two GET endpoints. Polling is best-effort and non-blocking; if
+the bot is down, the recorder still produces a valid `run.yaml` with
+zeroed target fields and a `bot_unreachable` event in `events.jsonl`.
 
 ---
 
@@ -372,14 +549,18 @@ flowlab/
 ├── replay/              Rust: engine, WAL, ring, ITCH, MoldUDP64, UDP
 ├── flow/                Rust: microstructure analytics + risk gate
 ├── chaos/               Rust (+C++): HFT aggression detection
-├── lab/                 Rust: strategy sandbox
 ├── verify/              Rust: cross-language state hashing
+├── engine/              Rust: live runtime + TCP telemetry wire (:9090)
 ├── hotpath/             C++20: book, matching sim, rolling stats
 ├── feed-parser/         Zig 0.13: comptime ITCH parsers, zero-copy
 ├── ingest/              Go: WS / HTTP / file ingest, mmap ring producer
-├── api/                 Go: control plane + Prometheus
+├── api/                 Go: control plane, CHAOS injector, recorder (:8080)
+├── dashboard/           React + Vite + uPlot: CHAOS desk UI
 ├── bench/               Rust: criterion benchmarks
-├── data/                Binary event logs (raw + normalized)
+├── bin/                 Built Go binaries (api server)
+├── data/                Binary event logs + run artefacts (data/runs/)
+├── docs/                Notes (latency methodology, etc.)
+├── run-desk.ps1         One-shot orchestrator (engine + api + dashboard)
 ├── .github/workflows/   CI matrix (Linux + Windows, ±native)
 ├── Cargo.toml           Rust workspace
 ├── go.work              Go workspace
@@ -430,22 +611,41 @@ cd feed-parser && zig build test --summary all      # Zig unit tests
 cd ingest      && go test -race -count=1 ./...      # Go
 ```
 
-Current passing counts (verified by `grep -c '^\s*#\[test\]'` and
-`grep -c '^test '`):
+Current passing counts (verified by `cargo test --workspace`):
 
-| Surface                                       | Tests  |
-| --------------------------------------------- | ------ |
-| `flowlab-replay` (unit + integration)         | 31 + 2 |
-| `flowlab-flow` (circuit breaker, etc.)        | 7      |
-| `flowlab-core` (`hot_book`, event, state)     | 9      |
-| `flowlab-bench` (cross-impl hash agreement)   | 2      |
-| `flowlab-e2e` (chaos + e2e + fuzz harnesses)  | ~20    |
-| Zig `feed-parser` (`itch.zig` + `main.zig`)   | 12     |
-| **Total**                                     | **83** |
+| Surface                                       | Tests   |
+| --------------------------------------------- | ------- |
+| `flowlab-chaos` (5 storm injectors + legacy)  | 51      |
+| `flowlab-replay` (unit + integration)         | 31 + 2  |
+| `flowlab-e2e` (chaos + e2e + fuzz harnesses)  | 23      |
+| `flowlab-flow` (circuit breaker, analytics)   | 10      |
+| `flowlab-core` (`hot_book`, event, state)     | 8       |
+| `flowlab-engine` (lib + main + ich_real)      | 3       |
+| `flowlab-bench` (cross-impl hash agreement)   | 2       |
+| `flowlab-verify`                              | 1       |
+| Zig `feed-parser` (`itch.zig` + `main.zig`)   | 12      |
+| **Total**                                     | **134** |
 
 Go `ingest/` and `api/` are infra-only (mmap ring producer + control
 plane) and currently have no unit tests; they are exercised end-to-end
 by the Rust replay + cross-impl hash harness.
+
+### Test layout
+
+FLOWLAB follows the conventional **three-tier test pyramid** of every
+language in the stack. Tests live next to what they prove, by design:
+
+| Tier            | Where                                                | What it proves                                  |
+| --------------- | ---------------------------------------------------- | ----------------------------------------------- |
+| **Unit**        | `#[cfg(test)] mod tests` at the bottom of each Rust module (`chaos/src/*.rs`, `flow/src/*.rs`, `core/src/*.rs`, …); `*_test.go` next to each Go file; `test "..."` blocks in each `.zig` source | Module-internal invariants. Access to `pub(crate)` and unexported items — **must** stay co-located. |
+| **Integration** | `<crate>/tests/*.rs` (e.g. [engine/tests/ich_real.rs](engine/tests/ich_real.rs), [replay/tests/ring_ipc.rs](replay/tests/ring_ipc.rs)) | The crate's **public** API contract. Compiled as a separate binary; can only see `pub` items. |
+| **System**      | [tests/](tests/) (`flowlab-e2e` crate — e2e/, fuzz/, chaos/) | Cross-crate invariants: bit-exact replay, hash agreement, ring SPSC ordering, parser robustness, 10 M-event drift. The *signal layer*. |
+
+`cargo test --workspace` collects every Rust tier in one command; tier
+separation is structural, not procedural. Putting unit tests anywhere
+but next to the module they cover would force `pub(crate)` items to
+leak into the public API — the layout above is the language
+convention, not loose organization.
 
 ---
 
@@ -519,11 +719,13 @@ banners.
   Acquire/Release fences
 - ITCH 5.0 parser in both Rust and Zig with cross-impl event
   agreement
-- Microstructure analytics: imbalance, rolling spread, VPIN, price
-  impact, threshold-based regime classifier (Calm/Volatile/
-  Aggressive/Crisis)
+- Microstructure analytics: imbalance, rolling spread, VPIN,
+  threshold-based regime classifier (Calm/Volatile/Aggressive/Crisis)
 - Circuit breaker: 6 guards, fail-closed latch, 7 unit tests
-- Chaos infrastructure: clustering and stress-window extractor
+- Chaos infrastructure: 5 live storm injectors (PhantomLiquidity,
+  CancellationStorm, MomentumIgnition, FlashCrash, LatencyArbProxy),
+  legacy quote-stuff / spoof detectors, clustering, stress-window
+  extractor
 - Three chaos integration tests: 10 M-event drift, corruption
   injection, multi-thread burst desync
 - C++ `OrderBook<MaxLevels>` (flat-array L2) and Welford
@@ -535,8 +737,8 @@ banners.
 | ---- | ------ | --------- |
 | C++ SIMD batch stats | Header-only `RollingStats` is real; SIMD batch update is a TODO | [hotpath/src/stats.cpp](hotpath/src/stats.cpp) |
 | Snapshot serialize/deserialize | Struct only; no on-disk format yet | [replay/src/snapshot.rs](replay/src/snapshot.rs) |
-| Lab matching engine | `Strategy` trait + `StrategyExecutor` exist; orders are emitted but not matched against the book yet | [lab/src/executor.rs](lab/src/executor.rs) |
-| Chaos pattern detectors | Quote-stuffing and spoofing implemented; the other 5 `ChaosKind` variants (PhantomLiquidity, CancellationStorm, MomentumIgnition, FlashCrash, LatencyArbitrage) are reserved enum members consumed by clustering/window but have no detector yet | [chaos/src/detection.rs](chaos/src/detection.rs) |
+| Lab matching engine | Removed in favor of integrating live external bots through the `/bot/state` adapter; see Adversarial Desk below | [api/server/bot_proxy.go](api/server/bot_proxy.go) |
+| Chaos pattern detectors (passive) | All 5 storm kinds have **active injectors** (`api/server/feed.go`); the **passive detector** counterparts (`PhantomLiquidityDetector`, `CancellationStormDetector`, `MomentumIgnitionDetector`, `FlashCrashDetector`, `LatencyArbProxyDetector`) classify their own injected output and the legacy `QuoteStuff`/`Spoof` paths, but are not yet wired into the engine pipeline | [chaos/src/chain.rs](chaos/src/chain.rs) |
 | Windows mmap ring writer | Linux/macOS/FreeBSD only; Windows path returns an explicit error and recommends WSL | [ingest/mmap/ring_windows.go](ingest/mmap/ring_windows.go) |
 | Control API | `/health` and `/status` only; `/metrics` and `/ingest/*` are TODO | [api/server/server.go](api/server/server.go) |
 

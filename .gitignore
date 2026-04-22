@@ -46,3 +46,8 @@ Thumbs.db
 
 # Local-only notes (not for commit)
 *.local.md
+
+# local datasets and run recordings
+data/itch/
+api/data/
+

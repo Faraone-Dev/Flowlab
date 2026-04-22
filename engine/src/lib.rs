@@ -9,4 +9,5 @@ pub mod ich;
 pub mod server;
 pub mod source;
 pub mod synthetic;
+pub mod tsc;
 pub mod wire;

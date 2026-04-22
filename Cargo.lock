@@ -430,16 +430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowlab-lab"
-version = "0.1.0"
-dependencies = [
- "flowlab-chaos",
- "flowlab-core",
- "flowlab-flow",
- "tracing",
-]
-
-[[package]]
 name = "flowlab-replay"
 version = "0.1.0"
 dependencies = [
