@@ -21,6 +21,10 @@ go.sum
 # Data
 data/raw/
 data/normalized/
+data/itch/raw/
+data/itch/unpacked/
+data/itch/*.out
+data/itch/*.err
 !data/.gitkeep
 
 # IDE
@@ -39,3 +43,6 @@ Thumbs.db
 .env.local
 *.pem
 *.key
+
+# Local-only notes (not for commit)
+*.local.md

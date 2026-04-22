@@ -87,20 +87,38 @@ impl OrderBook {
 
     fn cancel_order(&mut self, event: &Event) -> bool {
         let oid = event.order_id;
-        let Some(order) = self.orders.remove(&oid) else {
+        // Mirror HotOrderBook semantics: ITCH 'D' arrives with qty=0
+        // (full delete using stored order qty), ITCH 'X' arrives with
+        // qty=cancelled_shares (partial -- keep order alive if residual
+        // remains).
+        let Some(order) = self.orders.get_mut(&oid) else {
             return false;
         };
 
-        let levels = match order.side {
+        let (price, deduct_qty, side, release_slot) =
+            if event.qty == 0 || event.qty >= order.qty {
+                let q = order.qty;
+                let p = order.price;
+                let s = order.side;
+                self.orders.remove(&oid);
+                (p, q, s, true)
+            } else {
+                order.qty -= event.qty;
+                (order.price, event.qty, order.side, false)
+            };
+
+        let levels = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
 
-        if let Some(level) = levels.get_mut(&order.price) {
-            level.total_qty = level.total_qty.saturating_sub(order.qty);
-            level.order_count = level.order_count.saturating_sub(1);
-            if level.order_count == 0 {
-                levels.remove(&order.price);
+        if let Some(level) = levels.get_mut(&price) {
+            level.total_qty = level.total_qty.saturating_sub(deduct_qty);
+            if release_slot {
+                level.order_count = level.order_count.saturating_sub(1);
+                if level.order_count == 0 {
+                    levels.remove(&price);
+                }
             }
         }
 

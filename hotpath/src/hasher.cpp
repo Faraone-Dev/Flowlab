@@ -1,37 +1,50 @@
 #include "flowlab/hasher.h"
-#include <cstring>
 
-// Minimal xxh3-64 implementation for cross-language hash verification.
-// Production: link xxHash library. This is a simplified version for bootstrapping.
+// Use the official xxHash single-header implementation, inlined into this
+// translation unit. We keep XXH_INLINE_ALL so no extra link step is needed
+// and only this .cpp pays the compilation cost.
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
+#include <cstring>
 
 namespace flowlab {
 
-static uint64_t xxh3_simple(const uint8_t* data, size_t len) noexcept {
-    // FNV-1a as placeholder until xxHash is linked
-    // TODO: replace with real xxh3_64 for cross-language verification
-    uint64_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<uint64_t>(data[i]);
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
+// Mirror of Rust `flowlab-verify::StateHasher::update`:
+//
+//     state = xxh3_64( state.to_le_bytes() || data )
+//
+// Stack-buffered for the common small-input path, falling back to streaming
+// only for inputs larger than 4 KiB. No allocations, no exceptions.
 void StateHasher::update(const uint8_t* data, size_t len) noexcept {
-    uint8_t buf[8];
-    std::memcpy(buf, &state_, 8);
+    constexpr size_t kStackBuf = 4096;
+    uint8_t stack[kStackBuf];
+    uint8_t prev_le[8];
 
-    // H(prev_hash || data)
-    size_t total = 8 + len;
-    auto* combined = new uint8_t[total]; // TODO: stack alloc for small sizes
-    std::memcpy(combined, buf, 8);
-    std::memcpy(combined + 8, data, len);
-    state_ = xxh3_simple(combined, total);
-    delete[] combined;
+    // Little-endian serialize prev state (matches Rust to_le_bytes()).
+    for (int i = 0; i < 8; ++i) {
+        prev_le[i] = static_cast<uint8_t>((state_ >> (i * 8)) & 0xFF);
+    }
+
+    const size_t total = 8 + len;
+
+    if (total <= kStackBuf) {
+        std::memcpy(stack, prev_le, 8);
+        if (len) std::memcpy(stack + 8, data, len);
+        state_ = XXH3_64bits(stack, total);
+        return;
+    }
+
+    // Streaming path: avoids any heap allocation regardless of input size.
+    XXH3_state_t st;
+    XXH3_64bits_reset(&st);
+    XXH3_64bits_update(&st, prev_le, 8);
+    XXH3_64bits_update(&st, data, len);
+    state_ = XXH3_64bits_digest(&st);
 }
 
 uint64_t xxh3_hash(const uint8_t* data, size_t len) noexcept {
-    return xxh3_simple(data, len);
+    return XXH3_64bits(data, len);
 }
 
 } // namespace flowlab

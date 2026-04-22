@@ -161,6 +161,184 @@ pub fn realistic_events(n: usize, cfg: &MarketConfig) -> Vec<SequencedEvent> {
     out
 }
 
+/// **Bursty** stream: like `realistic_events` but with the cancel
+/// share inflated to ~55 % and the trade share to ~10 %. Designed to
+/// stress the cancel-rate baseline (`CancellationStormDetector`) and
+/// the phantom-cycle path. Best moves often → exercises the
+/// `flash_crash` band-cache invalidation path.
+pub fn bursty_events(n: usize, cfg: &MarketConfig) -> Vec<SequencedEvent> {
+    let mut rng = XorShift64(cfg.seed.wrapping_add(0x42));
+    let mut out = Vec::with_capacity(n);
+    let mut live: Vec<(u64, u64, u64, u8)> = Vec::with_capacity(n / 2);
+    let mut next_order_id: u64 = 1;
+
+    for i in 0..n {
+        let roll = rng.next_bounded(100);
+        // 35 % adds, 55 % cancels, 10 % trades (flipped vs realistic).
+        let etype = if roll < 35 || live.is_empty() {
+            EventType::OrderAdd
+        } else if roll < 90 {
+            EventType::OrderCancel
+        } else {
+            EventType::Trade
+        };
+
+        let event = match etype {
+            EventType::OrderAdd => {
+                let level_offset = rng.geometric(cfg.top_concentration, 100).min(cfg.max_levels - 1);
+                let side_bit = (rng.next_u64() & 1) as u8;
+                let price = if side_bit == 0 {
+                    cfg.mid_price.saturating_sub(level_offset * cfg.tick_size).max(1)
+                } else {
+                    cfg.mid_price + (level_offset + 1) * cfg.tick_size
+                };
+                let qty = 10 + rng.next_bounded(90);
+                let oid = next_order_id;
+                next_order_id += 1;
+                live.push((oid, price, qty, side_bit));
+                Event {
+                    ts: (i as u64) * 1_000,
+                    instrument_id: 1,
+                    event_type: EventType::OrderAdd as u8,
+                    side: side_bit,
+                    price,
+                    qty,
+                    order_id: oid,
+                    _pad: [0; 2],
+                }
+            }
+            EventType::OrderCancel => {
+                let idx = rng.next_bounded(live.len() as u64) as usize;
+                let (oid, price, qty, side) = live.swap_remove(idx);
+                Event {
+                    ts: (i as u64) * 1_000,
+                    instrument_id: 1,
+                    event_type: EventType::OrderCancel as u8,
+                    side,
+                    price,
+                    qty,
+                    order_id: oid,
+                    _pad: [0; 2],
+                }
+            }
+            EventType::Trade => {
+                let idx = rng.next_bounded(live.len() as u64) as usize;
+                let (oid, price, qty, side) = live[idx];
+                let fill = (qty / 2).max(1);
+                if fill >= qty {
+                    live.swap_remove(idx);
+                } else {
+                    live[idx].2 -= fill;
+                }
+                Event {
+                    ts: (i as u64) * 1_000,
+                    instrument_id: 1,
+                    event_type: EventType::Trade as u8,
+                    side,
+                    price,
+                    qty: fill,
+                    order_id: oid,
+                    _pad: [0; 2],
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        out.push(SequencedEvent {
+            seq: (i as u64) + 1,
+            channel_id: 0,
+            event,
+        });
+    }
+    out
+}
+
+/// **Crashy** stream: a `realistic_events` body interrupted every
+/// ~5 000 events by a 50-event sweep that wipes the top of one side
+/// and closes with a directional trade burst. Designed to actually
+/// trigger `FlashCrashDetector` and `MomentumIgnitionDetector` so
+/// the `Some(flag)` branch of every detector is exercised under
+/// measurement (not just the no-flag fast path).
+pub fn crashy_events(n: usize, cfg: &MarketConfig) -> Vec<SequencedEvent> {
+    let base = realistic_events(n, cfg);
+    let mut out = Vec::with_capacity(n);
+    let mut rng = XorShift64(cfg.seed.wrapping_add(0xC0DE));
+    let mut seq: u64 = 1;
+    let mut ts: u64 = 0;
+    let crash_every: usize = 5_000;
+    let burst_size: usize = 50;
+    let mut next_order_id: u64 = 10_000_000;
+
+    for (i, src) in base.into_iter().enumerate() {
+        let mut e = src.event;
+        // Reseq + retime to keep the stream monotone after injection.
+        e.ts = ts;
+        let s = seq;
+        seq += 1;
+        ts = ts.wrapping_add(1_000);
+        out.push(SequencedEvent {
+            seq: s,
+            channel_id: 0,
+            event: e,
+        });
+
+        if i > 0 && i % crash_every == 0 {
+            // Pick a side to crush.
+            let side = if (rng.next_u64() & 1) == 0 { 0u8 } else { 1u8 };
+            let mid = cfg.mid_price;
+            for k in 0..burst_size {
+                // Sweep cancels from top inward.
+                let off = (k as u64) + 1;
+                let price = if side == 0 { mid.saturating_sub(off) } else { mid.saturating_add(off) };
+                let oid = next_order_id;
+                next_order_id += 1;
+                let s = seq;
+                seq += 1;
+                ts = ts.wrapping_add(1_000);
+                out.push(SequencedEvent {
+                    seq: s,
+                    channel_id: 0,
+                    event: Event {
+                        ts,
+                        instrument_id: 1,
+                        event_type: EventType::OrderCancel as u8,
+                        side,
+                        price,
+                        qty: 100,
+                        order_id: oid,
+                        _pad: [0; 2],
+                    },
+                });
+            }
+            // Closing aggression in the same direction.
+            for _ in 0..8 {
+                let s = seq;
+                seq += 1;
+                ts = ts.wrapping_add(1_000);
+                out.push(SequencedEvent {
+                    seq: s,
+                    channel_id: 0,
+                    event: Event {
+                        ts,
+                        instrument_id: 1,
+                        event_type: EventType::Trade as u8,
+                        side,
+                        price: if side == 0 {
+                            mid.saturating_sub(burst_size as u64 + 1)
+                        } else {
+                            mid.saturating_add(burst_size as u64 + 1)
+                        },
+                        qty: 50,
+                        order_id: 0,
+                        _pad: [0; 2],
+                    },
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Pre-warm book events (all OrderAdds) for steady-state measurement.
 pub fn warmup_events(n: usize, cfg: &MarketConfig) -> Vec<SequencedEvent> {
     let mut rng = XorShift64(cfg.seed.wrapping_add(1));

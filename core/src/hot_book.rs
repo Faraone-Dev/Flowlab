@@ -101,10 +101,10 @@ pub struct HotOrderBook<const MAX_LEVELS: usize = 256> {
 /// Per-order metadata: price it sits at, remaining qty, and side.
 /// Stored in a dense `Vec` (the slab); the hash index points to it by `u32`.
 #[derive(Debug, Clone, Copy)]
-struct OrderMeta {
-    price: u64,
-    qty: u64,
-    side: u8,
+pub struct OrderMeta {
+    pub price: u64,
+    pub qty: u64,
+    pub side: u8,
 }
 
 /// Slab-backed order index. Two layers:
@@ -153,6 +153,14 @@ impl OrderSlab {
         let slot = *self.index.get(&order_id)?;
         // SAFETY: index entries always reference live slab slots.
         Some(unsafe { self.data.get_unchecked_mut(slot as usize) })
+    }
+
+    /// Borrow the metadata for `order_id`, immutably.
+    #[inline]
+    fn get(&self, order_id: u64) -> Option<&OrderMeta> {
+        let slot = *self.index.get(&order_id)?;
+        // SAFETY: index entries always reference live slab slots.
+        Some(unsafe { self.data.get_unchecked(slot as usize) })
     }
 
     /// Remove the metadata for `order_id`, returning the previous value.
@@ -370,6 +378,18 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         }
     }
 
+    /// Size resting at the best bid level (0 if no bid).
+    #[inline]
+    pub fn best_bid_size(&self) -> u64 {
+        if self.bid_count > 0 { self.bids[0].total_qty } else { 0 }
+    }
+
+    /// Size resting at the best ask level (0 if no ask).
+    #[inline]
+    pub fn best_ask_size(&self) -> u64 {
+        if self.ask_count > 0 { self.asks[0].total_qty } else { 0 }
+    }
+
     #[inline]
     pub fn spread(&self) -> Option<u64> {
         match (self.best_bid(), self.best_ask()) {
@@ -386,6 +406,15 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
     #[inline]
     pub fn ask_count(&self) -> usize {
         self.ask_count as usize
+    }
+
+    /// Read-only accessor into the order-id slab. Returns the live
+    /// `OrderMeta` for `oid` if present. Useful for tests and tooling
+    /// that need to introspect the L3 state (residual qty after a
+    /// partial cancel, owning side, etc.).
+    #[inline]
+    pub fn order_meta(&self, oid: u64) -> Option<&OrderMeta> {
+        self.orders.get(oid)
     }
 
     /// Bid depth across top `n` levels.
@@ -581,22 +610,52 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         }
     }
 
-    /// Cancel an order. Resolution priority:
-    ///   1. `order_id != 0` and present in the lookup map \u2192 use stored
-    ///      `(price, side, qty)` (ITCH 5.0 semantics: `D` carries only oid).
-    ///   2. `order_id != 0` and not present \u2192 drop the message (return
-    ///      `false`), matching `OrderBook` (BTreeMap) behaviour on unknown
-    ///      cancel refs.
-    ///   3. `order_id == 0` (legacy / synthetic pre-enriched events) \u2192
-    ///      fall back to `(event.price, event.side, event.qty)`.
+    /// Cancel an order. ITCH 5.0 carries two flavours that both arrive
+    /// as `EventType::OrderCancel`:
+    ///
+    ///   * `D` Order Delete  -> full removal. `e.qty == 0`. We drop the
+    ///     entire resting qty using the stored `meta.qty` and free the
+    ///     slab slot.
+    ///   * `X` Order Cancel  -> partial removal. `e.qty > 0` and equals
+    ///     the `cancelled_shares` field. We deduct `e.qty` from both
+    ///     the level total and the slab `meta.qty`. The slab slot is
+    ///     released only when the residual `meta.qty` reaches zero;
+    ///     in that case the level's `order_count` is decremented too.
+    ///
+    /// Resolution priority:
+    ///   1. `order_id != 0` and present in the lookup map -> use stored
+    ///      `(price, side)` and partial/full logic above.
+    ///   2. `order_id != 0` and not present -> drop the message (return
+    ///      `false`), matching `OrderBook` (BTreeMap) behaviour on
+    ///      unknown cancel refs.
+    ///   3. `order_id == 0` (legacy / synthetic pre-enriched events) ->
+    ///      fall back to `(event.price, event.side, event.qty)` and
+    ///      treat as a full delete (single anonymous order).
     fn cancel_order(&mut self, e: &Event) -> bool {
-        let (price, qty, is_bid) = if e.order_id != 0 {
-            match self.orders.remove(e.order_id) {
-                Some(meta) => (meta.price, meta.qty, meta.side == Side::Bid as u8),
-                None => return false,
+        // Resolve target level + cancelled qty + whether the slab slot
+        // should be released after the deduction.
+        let (price, qty, is_bid, release_slot) = if e.order_id != 0 {
+            // ITCH 'X' (partial) carries cancelled_shares > 0; ITCH 'D'
+            // (full delete) carries 0. Inspect the slab before deciding
+            // to release the slot -- partial cancels keep the order alive.
+            let Some(meta) = self.orders.get_mut(e.order_id) else {
+                return false;
+            };
+            let is_bid = meta.side == Side::Bid as u8;
+            let price = meta.price;
+            if e.qty == 0 || e.qty >= meta.qty {
+                // Full delete (or 'X' that wipes the residual).
+                let removed_qty = meta.qty;
+                self.orders.remove(e.order_id);
+                (price, removed_qty, is_bid, true)
+            } else {
+                // True partial: deduct cancelled_shares from the slab,
+                // keep the slot live for further cancels / fills.
+                meta.qty -= e.qty;
+                (price, e.qty, is_bid, false)
             }
         } else {
-            (e.price, e.qty, e.side == Side::Bid as u8)
+            (e.price, e.qty, e.side == Side::Bid as u8, true)
         };
 
         let (levels, count) = if is_bid {
@@ -608,10 +667,14 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
 
         if let Some(i) = Self::find_level(levels, cnt, price, is_bid) {
             levels[i].total_qty = levels[i].total_qty.saturating_sub(qty);
-            levels[i].order_count = levels[i].order_count.saturating_sub(1);
-
-            if levels[i].order_count == 0 {
-                Self::remove_level(levels, count, i);
+            // Only decrement order_count when the underlying order is
+            // actually being released. Partial cancels leave the order
+            // (and the level's order_count) intact.
+            if release_slot {
+                levels[i].order_count = levels[i].order_count.saturating_sub(1);
+                if levels[i].order_count == 0 {
+                    Self::remove_level(levels, count, i);
+                }
             }
             return true;
         }
@@ -796,6 +859,53 @@ mod tests {
 
         assert_eq!(book.bid_count(), 0);
         assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_partial_cancel_keeps_order_alive() {
+        // ITCH 'X' Order Cancel: cancelled_shares < resting qty.
+        // The order must stay in the slab with the residual qty, the
+        // level total_qty must be deducted, but order_count must NOT
+        // decrement (the level still hosts one live order).
+        let mut book = HotOrderBook::<64>::new(1);
+
+        // Two orders at the same level so we can detect a wrong
+        // order_count decrement (would drop to 1 instead of staying 2).
+        book.apply(&make_event_oid(EventType::OrderAdd, Side::Bid, 100, 10, 1));
+        book.apply(&make_event_oid(EventType::OrderAdd, Side::Bid, 100, 5, 2));
+
+        assert_eq!(book.bid_levels()[0].total_qty, 15);
+        assert_eq!(book.bid_levels()[0].order_count, 2);
+
+        // Partial cancel: oid=1 loses 3 shares, residual = 7.
+        book.apply(&make_event_oid(EventType::OrderCancel, Side::Bid, 0, 3, 1));
+
+        assert_eq!(
+            book.bid_levels()[0].total_qty,
+            12,
+            "level total_qty must drop by exactly the cancelled qty"
+        );
+        assert_eq!(
+            book.bid_levels()[0].order_count,
+            2,
+            "partial cancel must NOT decrement order_count"
+        );
+        let meta = book
+            .order_meta(1)
+            .expect("oid 1 must still be live in the slab after partial cancel");
+        assert_eq!(meta.qty, 7, "slab qty must reflect the residual");
+
+        // Wiping the residual (qty == residual) must promote to a full
+        // delete and free the slab slot + decrement order_count.
+        book.apply(&make_event_oid(EventType::OrderCancel, Side::Bid, 0, 7, 1));
+        assert!(book.order_meta(1).is_none(), "oid 1 must be released");
+        assert_eq!(book.bid_levels()[0].total_qty, 5);
+        assert_eq!(book.bid_levels()[0].order_count, 1);
+
+        // ITCH 'D' (qty=0) on remaining oid=2 must fully delete it.
+        book.apply(&make_event_oid(EventType::OrderCancel, Side::Bid, 0, 0, 2));
+        assert_eq!(book.bid_count(), 0, "level must be removed");
+        assert!(book.order_meta(2).is_none());
     }
 
     #[test]

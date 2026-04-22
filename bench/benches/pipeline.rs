@@ -115,7 +115,15 @@ fn bench_reference_vs_hot(c: &mut Criterion) {
         h1, h2,
         "HotOrderBook and OrderBook disagree on canonical L2 hash after {applied} events (h1={h1:#x} h2={h2:#x})"
     );
-    eprintln!("✓ cross-impl L2 agreement (add+cancel+trade): canonical_l2_hash = {h1:#018x} over {applied} events");
+    eprintln!();
+    eprintln!("  cross-impl L2 agreement  (HotOrderBook vs OrderBook/BTreeMap)");
+    eprintln!("  -----------------------------------------------------------------");
+    eprintln!("  events applied   : {applied}");
+    eprintln!("  message types    : OrderAdd + OrderCancel + Trade");
+    eprintln!("  hot canonical L2 : {h1:#018x}");
+    eprintln!("  btm canonical L2 : {h2:#018x}");
+    eprintln!("  status           : PASS (bit-identical)");
+    eprintln!();
 
     let mut group = c.benchmark_group("pipeline/reference_replay");
     group.throughput(Throughput::Elements(parsed.len() as u64));
@@ -163,12 +171,11 @@ fn bench_cpp_agreement(c: &mut Criterion) {
     let mut parsed: Vec<Event> = Vec::with_capacity(n);
     parse_buffer(&raw, &mut parsed).unwrap();
 
-    // Cross-language agreement: C++ book and Rust HotOrderBook must agree
-    // on their respective state hashes when fed the same event stream.
-    // Note: the two hashes use different schemes (C++ uses its own digest,
-    // Rust uses canonical_l2_hash). We therefore assert deterministic
-    // *per-impl* hashes across two runs — catching non-determinism across
-    // the FFI boundary.
+    // Cross-language agreement: C++ `flowlab_orderbook_hash` and Rust
+    // `HotOrderBook::canonical_l2_hash` both implement the same canonical
+    // L2 scheme (domain tag "FLOWLAB-L2-v1", 16-byte per-level payload of
+    // (price_le, total_qty_le), '|' side separator, XOR-fold via
+    // XXH3_64bits_withSeed). They MUST agree byte-for-byte for every run.
     let mut rust_hashes = [0u64; 2];
     let mut cpp_hashes = [0u64; 2];
     for run in 0..2 {
@@ -187,10 +194,21 @@ fn bench_cpp_agreement(c: &mut Criterion) {
     }
     assert_eq!(rust_hashes[0], rust_hashes[1], "Rust hash non-deterministic");
     assert_eq!(cpp_hashes[0], cpp_hashes[1], "C++ hash non-deterministic across FFI");
-    eprintln!(
-        "✓ cross-lang determinism: rust={:#018x} cpp={:#018x}",
+    assert_eq!(
+        rust_hashes[0], cpp_hashes[0],
+        "Rust/C++ canonical L2 hash disagreement: rust={:#018x} cpp={:#018x}",
         rust_hashes[0], cpp_hashes[0]
     );
+    eprintln!();
+    eprintln!("  cross-lang L2 agreement  (Rust HotOrderBook vs C++ OrderBook)");
+    eprintln!("  -----------------------------------------------------------------");
+    eprintln!("  events applied   : {}", parsed.len());
+    eprintln!("  scheme           : FLOWLAB-L2-v1 | XXH3 | 16B/level | '|' sep");
+    eprintln!("  rust hash        : {:#018x}", rust_hashes[0]);
+    eprintln!("  cpp  hash        : {:#018x}", cpp_hashes[0]);
+    eprintln!("  determinism      : 2/2 runs equal per impl");
+    eprintln!("  status           : PASS (byte-for-byte cross-FFI)");
+    eprintln!();
 
     let mut group = c.benchmark_group("pipeline/cross_lang");
     group.throughput(Throughput::Elements(parsed.len() as u64));

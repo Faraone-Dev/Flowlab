@@ -1,6 +1,19 @@
+pub mod cancellation_storm;
+pub mod chain;
 pub mod detection;
 pub mod clustering;
+pub mod flash_crash;
+pub mod latency_arb_proxy;
+pub mod momentum_ignition;
+pub mod phantom_liquidity;
 pub mod window;
+
+pub use cancellation_storm::CancellationStormDetector;
+pub use chain::ChaosChain;
+pub use flash_crash::FlashCrashDetector;
+pub use latency_arb_proxy::LatencyArbProxyDetector;
+pub use momentum_ignition::MomentumIgnitionDetector;
+pub use phantom_liquidity::PhantomLiquidityDetector;
 
 use flowlab_core::types::SeqNum;
 

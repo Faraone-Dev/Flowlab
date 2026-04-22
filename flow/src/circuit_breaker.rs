@@ -46,6 +46,23 @@ pub enum Decision {
     Block(HaltReason),
 }
 
+/// Read-only state sampled from [`CircuitBreaker::snapshot`], suitable
+/// for telemetry frames and dashboards. Intentionally a plain POD so
+/// downstream code can serialise or forward it without touching any
+/// locks or atomics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BreakerSnapshot {
+    pub halted: bool,
+    pub reason: Option<HaltReason>,
+    pub orders_sent: u64,
+    pub trades_done: u64,
+    pub cash_flow_ticks: i64,
+    /// Sum of `|pos|` across all tracked instruments.
+    pub net_position: i64,
+    /// Gaps observed within `cfg.gap_window`.
+    pub gaps_in_window: u32,
+}
+
 /// Side of a prospective order, in the same orientation as
 /// [`flowlab_core::event::Side`] (0 = bid/buy, 1 = ask/sell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +161,35 @@ impl CircuitBreaker {
 
     pub fn halt_reason(&self) -> Option<HaltReason> {
         *self.reason.lock().unwrap()
+    }
+
+    /// Read-only snapshot for telemetry/UI. Takes the internal locks
+    /// briefly so the returned values are consistent with each other
+    /// (orders_sent / trades_done / cash / net position / recent gaps
+    /// are all sampled before any of them can change again).
+    pub fn snapshot(&self) -> BreakerSnapshot {
+        let orders_sent = self.orders_sent.load(Ordering::Relaxed);
+        let trades_done = self.trades_done.load(Ordering::Relaxed);
+        let cash_flow_ticks = *self.cash_flow_ticks.lock().unwrap();
+        let net_position: i64 = {
+            let positions = self.positions.lock().unwrap();
+            positions.values().map(|p| p.abs()).sum()
+        };
+        let gaps_in_window = {
+            let mut log = self.gap_log.lock().unwrap();
+            let cutoff = Instant::now() - self.cfg.gap_window;
+            log.retain(|t| *t >= cutoff);
+            log.len() as u32
+        };
+        BreakerSnapshot {
+            halted: self.is_halted(),
+            reason: self.halt_reason(),
+            orders_sent,
+            trades_done,
+            cash_flow_ticks,
+            net_position,
+            gaps_in_window,
+        }
     }
 
     /// Fail-closed pre-trade check. Call before every outbound order.

@@ -1,11 +1,13 @@
+use std::collections::VecDeque;
 use flowlab_core::event::{EventType, SequencedEvent};
 use flowlab_core::types::SeqNum;
 use crate::{ChaosEvent, ChaosFeatures, ChaosKind};
 
 /// Quote stuffing detector — tracks add/cancel burst rates.
 pub struct QuoteStuffDetector {
-    /// Rolling window of (seq, event_type) for burst detection
-    window: Vec<(SeqNum, u8)>,
+    /// Rolling window of (seq, event_type) for burst detection.
+    /// VecDeque for O(1) pop_front — Vec::remove(0) is O(n).
+    window: VecDeque<(SeqNum, u8)>,
     /// Max events in detection window
     window_size: usize,
     /// Cancel/trade ratio threshold
@@ -15,7 +17,7 @@ pub struct QuoteStuffDetector {
 impl QuoteStuffDetector {
     pub fn new(window_size: usize, cancel_ratio_threshold: f64) -> Self {
         Self {
-            window: Vec::with_capacity(window_size),
+            window: VecDeque::with_capacity(window_size),
             window_size,
             cancel_ratio_threshold,
         }
@@ -35,9 +37,9 @@ impl QuoteStuffDetector {
         }
 
         if self.window.len() >= self.window_size {
-            self.window.remove(0);
+            self.window.pop_front();
         }
-        self.window.push((seq_event.seq, etype));
+        self.window.push_back((seq_event.seq, etype));
 
         // Check burst: count cancels vs trades in window
         let cancels = self
@@ -55,7 +57,7 @@ impl QuoteStuffDetector {
         let ratio = cancels / trades;
 
         if ratio >= self.cancel_ratio_threshold && self.window.len() >= self.window_size / 2 {
-            let start_seq = self.window.first().map(|(s, _)| *s).unwrap_or(0);
+            let start_seq = self.window.front().map(|(s, _)| *s).unwrap_or(0);
             let end_seq = seq_event.seq;
 
             Some(ChaosEvent {

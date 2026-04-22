@@ -6,5 +6,7 @@ pub mod impact;
 pub mod regime;
 
 pub use circuit_breaker::{
-    BreakerConfig, CircuitBreaker, Decision, Fill, HaltReason, Intent, Side,
+    BreakerConfig, BreakerSnapshot, CircuitBreaker, Decision, Fill, HaltReason, Intent, Side,
 };
+pub use regime::{Regime, RegimeClassifier, RegimeInput};
+pub use spread::{SpreadMetrics, SpreadTracker};

@@ -8,16 +8,24 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Enables the cross-language Rust↔C++ harnesses (links against the
+# native hot path produced by `core/build.rs`). Requires the C++
+# static lib and the Zig feed-parser static lib to be present.
+native = ["flowlab-core/native"]
+
 [dependencies]
 flowlab-core.workspace = true
 flowlab-replay.workspace = true
 flowlab-flow.workspace = true
+flowlab-verify.workspace = true
 bytemuck.workspace = true
 
 [dev-dependencies]
 flowlab-core.workspace = true
 flowlab-replay.workspace = true
 flowlab-flow.workspace = true
+flowlab-verify.workspace = true
 bytemuck.workspace = true
 
 [[test]]
@@ -51,3 +59,8 @@ path = "chaos/corruption_injection.rs"
 [[test]]
 name = "chaos_long_run_drift"
 path = "chaos/long_run_drift.rs"
+
+[[test]]
+name = "e2e_cpp_hasher_agreement"
+path = "e2e/cpp_hasher_agreement.rs"
+required-features = ["native"]

@@ -2,6 +2,13 @@
 #include "flowlab/orderbook.h"
 #include "flowlab/hasher.h"
 
+// Pull in xxHash directly so we can call XXH3_64bits / _withSeed from
+// flowlab_orderbook_hash. XXH_INLINE_ALL must be defined exactly once
+// per translation unit before the header is seen — define it locally
+// (hasher.cpp does the same in its own TU).
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 #include <cstring>
 
 using Book = flowlab::OrderBook<256>;
@@ -35,18 +42,44 @@ uint64_t flowlab_orderbook_spread(const void* book) {
 }
 
 uint64_t flowlab_orderbook_hash(const void* book) {
-    // Hash all bid/ask levels
-    flowlab::StateHasher hasher;
+    // CANONICAL L2 HASH — must agree byte-for-byte with the Rust
+    // implementation in `flowlab-core::hot_book::HotOrderBook::canonical_l2_hash`.
+    //
+    // Scheme:
+    //   * domain tag         : XXH3_64bits("FLOWLAB-L2-v1")  -> seed
+    //   * per-level payload  : 16 raw bytes = (price_le, total_qty_le)
+    //                          NOT the full Level struct (the Rust side
+    //                          excludes order_count + tail padding).
+    //   * fold               : h ^= XXH3_64bits_withSeed(buf16, 16, h)
+    //   * side separator     : h = XXH3_64bits_withSeed("|", 1, h)
+    //
+    // Iterate bids (descending) then asks (ascending) — matches the
+    // canonical traversal order in HotOrderBook.
     auto* b = static_cast<const Book*>(book);
 
+    static constexpr char kTag[] = "FLOWLAB-L2-v1";
+    uint64_t h = XXH3_64bits(kTag, sizeof(kTag) - 1);
+
+    uint8_t buf[16];
+
+    const flowlab::Level* bids = b->bids();
     for (size_t i = 0; i < b->bid_levels(); ++i) {
-        hasher.update(reinterpret_cast<const uint8_t*>(&b->bids()[i]), sizeof(flowlab::Level));
-    }
-    for (size_t i = 0; i < b->ask_levels(); ++i) {
-        hasher.update(reinterpret_cast<const uint8_t*>(&b->asks()[i]), sizeof(flowlab::Level));
+        std::memcpy(buf,     &bids[i].price,     8);
+        std::memcpy(buf + 8, &bids[i].total_qty, 8);
+        h ^= XXH3_64bits_withSeed(buf, 16, h);
     }
 
-    return hasher.digest();
+    static constexpr char kSep = '|';
+    h = XXH3_64bits_withSeed(&kSep, 1, h);
+
+    const flowlab::Level* asks = b->asks();
+    for (size_t i = 0; i < b->ask_levels(); ++i) {
+        std::memcpy(buf,     &asks[i].price,     8);
+        std::memcpy(buf + 8, &asks[i].total_qty, 8);
+        h ^= XXH3_64bits_withSeed(buf, 16, h);
+    }
+
+    return h;
 }
 
 void* flowlab_hasher_new() {

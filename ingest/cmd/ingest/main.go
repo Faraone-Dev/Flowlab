@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/IvanPiardi/flowlab/ingest/feed"
-	"github.com/IvanPiardi/flowlab/ingest/mmap"
+	"github.com/Faraone-Dev/flowlab/ingest/feed"
+	"github.com/Faraone-Dev/flowlab/ingest/mmap"
 )
 
 func main() {

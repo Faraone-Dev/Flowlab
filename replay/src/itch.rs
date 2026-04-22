@@ -79,6 +79,25 @@ fn event_zeroed() -> Event {
     unsafe { core::mem::zeroed() }
 }
 
+/// Stock Directory ('R') message — emitted once per ticker at session
+/// start. Gives us the `stock_locate -> symbol` map the rest of the feed
+/// assumes is already known.
+///
+/// Layout (39 bytes total):
+///   Type[1] StkLoc[2] TrackNum[2] Timestamp[6] Stock[8] ...
+///
+/// Returns `(stock_locate, symbol)` with symbol trimmed of trailing spaces.
+pub fn parse_stock_directory(m: &[u8]) -> Option<(u32, String)> {
+    if m.len() < 19 || m[0] != b'R' {
+        return None;
+    }
+    let stock_locate = rd_u16(m, 1) as u32;
+    let raw = &m[11..19];
+    let end = raw.iter().rposition(|&c| c != b' ').map(|i| i + 1).unwrap_or(0);
+    let sym = std::str::from_utf8(&raw[..end]).ok()?.to_string();
+    Some((stock_locate, sym))
+}
+
 /// Parse a single ITCH message starting at `m`. Returns Some(Event) if
 /// the message type produces a canonical event, None for ignored types.
 pub fn dispatch(m: &[u8]) -> Option<Event> {
@@ -101,6 +120,7 @@ fn parse_add_order(m: &[u8]) -> Option<Event> {
     // A: Type[1] StkLoc[2] TrackNum[2] Timestamp[6] OrderRefNum[8]
     //    BuySell[1] Shares[4] Stock[8] Price[4]                   = 36
     if m.len() < 36 { return None; }
+    let stock_locate = rd_u16(m, 1) as u32;
     let ts = rd_ts48(m, 5);
     let order_id = rd_u64(m, 11);
     let side = if m[19] == b'B' { Side::Bid as u8 } else { Side::Ask as u8 };
@@ -111,6 +131,7 @@ fn parse_add_order(m: &[u8]) -> Option<Event> {
     e.price = price;
     e.qty = shares;
     e.order_id = order_id;
+    e.instrument_id = stock_locate;
     e.event_type = EventType::OrderAdd as u8;
     e.side = side;
     Some(e)
@@ -119,11 +140,13 @@ fn parse_add_order(m: &[u8]) -> Option<Event> {
 fn parse_order_delete(m: &[u8]) -> Option<Event> {
     // D: Type[1] StkLoc[2] TrackNum[2] Timestamp[6] OrderRefNum[8] = 19
     if m.len() < 19 { return None; }
+    let stock_locate = rd_u16(m, 1) as u32;
     let ts = rd_ts48(m, 5);
     let order_id = rd_u64(m, 11);
     let mut e = event_zeroed();
     e.ts = ts;
     e.order_id = order_id;
+    e.instrument_id = stock_locate;
     e.event_type = EventType::OrderCancel as u8;
     Some(e)
 }
@@ -131,6 +154,7 @@ fn parse_order_delete(m: &[u8]) -> Option<Event> {
 fn parse_order_cancel(m: &[u8]) -> Option<Event> {
     // X: ... OrderRefNum[8] CancelledShares[4] = 23
     if m.len() < 23 { return None; }
+    let stock_locate = rd_u16(m, 1) as u32;
     let ts = rd_ts48(m, 5);
     let order_id = rd_u64(m, 11);
     let qty = rd_u32(m, 19) as u64;
@@ -138,6 +162,7 @@ fn parse_order_cancel(m: &[u8]) -> Option<Event> {
     e.ts = ts;
     e.qty = qty;
     e.order_id = order_id;
+    e.instrument_id = stock_locate;
     e.event_type = EventType::OrderCancel as u8;
     Some(e)
 }
@@ -146,6 +171,7 @@ fn parse_order_executed(m: &[u8]) -> Option<Event> {
     // E: ... OrderRefNum[8] Shares[4] MatchNum[8]                = 31
     // C: adds Printable[1] Price[4]                              = 36
     if m.len() < 31 { return None; }
+    let stock_locate = rd_u16(m, 1) as u32;
     let ts = rd_ts48(m, 5);
     let order_id = rd_u64(m, 11);
     let qty = rd_u32(m, 19) as u64;
@@ -159,6 +185,7 @@ fn parse_order_executed(m: &[u8]) -> Option<Event> {
     e.price = price;
     e.qty = qty;
     e.order_id = order_id;
+    e.instrument_id = stock_locate;
     e.event_type = EventType::Trade as u8;
     Some(e)
 }
@@ -166,6 +193,7 @@ fn parse_order_executed(m: &[u8]) -> Option<Event> {
 fn parse_trade(m: &[u8]) -> Option<Event> {
     // P: ... OrderRefNum[8] BuySell[1] Shares[4] Stock[8] Price[4] MatchNum[8] = 44
     if m.len() < 44 { return None; }
+    let stock_locate = rd_u16(m, 1) as u32;
     let ts = rd_ts48(m, 5);
     let order_id = rd_u64(m, 11);
     let side = if m[19] == b'B' { Side::Bid as u8 } else { Side::Ask as u8 };
@@ -176,6 +204,7 @@ fn parse_trade(m: &[u8]) -> Option<Event> {
     e.price = price;
     e.qty = qty;
     e.order_id = order_id;
+    e.instrument_id = stock_locate;
     e.event_type = EventType::Trade as u8;
     e.side = side;
     Some(e)

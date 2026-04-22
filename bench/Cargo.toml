@@ -26,9 +26,21 @@ harness = false
 name = "pipeline"
 harness = false
 
+[[bench]]
+name = "chaos_throughput"
+harness = false
+
 [[bin]]
 name = "latency_apply"
 path = "src/bin/latency_apply.rs"
+
+[[bin]]
+name = "layer_isolation"
+path = "src/bin/layer_isolation.rs"
+
+[[bin]]
+name = "chaos_latency"
+path = "src/bin/chaos_latency.rs"
 
 [dev-dependencies]
 criterion = { workspace = true }
