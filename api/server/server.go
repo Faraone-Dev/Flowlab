@@ -2,9 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -262,18 +265,54 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cors is a permissive CORS wrapper for dashboard development. The control
-// plane is read-only and never participates in the deterministic data path,
-// so allowing any origin during local dev is safe.
+// cors allows same-origin requests and loopback dashboard dev origins.
+// Rejecting foreign origins closes the control-plane's browser trust boundary
+// without affecting the local desk workflow.
 func cors(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if !isAllowedOrigin(r, origin) {
+				http.Error(w, "forbidden origin", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+func isAllowedOrigin(r *http.Request, origin string) bool {
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	return strings.EqualFold(normalizeHostPort(u.Host), normalizeHostPort(r.Host))
+}
+
+func normalizeHostPort(hostport string) string {
+	if hostport == "" {
+		return ""
+	}
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		return strings.ToLower(net.JoinHostPort(host, port))
+	}
+	return strings.ToLower(hostport)
 }

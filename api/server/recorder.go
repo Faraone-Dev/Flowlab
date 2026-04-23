@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
 )
+
+var runIDPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$`)
 
 // Recorder writes a desk-grade artefact set for one run:
 //
@@ -399,7 +402,7 @@ func (s *Server) handleRunList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]RunListEntry, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || !isSafeRunID(e.Name()) {
 			continue
 		}
 		_, err := os.Stat(filepath.Join(dir, e.Name(), "run.yaml"))
@@ -419,6 +422,10 @@ func (s *Server) handleRunYAML(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
+	if !isSafeRunID(id) {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
 	p := filepath.Join(s.recorder.rootDir, "data", "runs", id, "run.yaml")
 	f, err := os.Open(p)
 	if err != nil {
@@ -428,4 +435,8 @@ func (s *Server) handleRunYAML(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	io.Copy(w, f)
+}
+
+func isSafeRunID(id string) bool {
+	return runIDPattern.MatchString(id)
 }

@@ -12,7 +12,9 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // dashboard dev
+	CheckOrigin: func(r *http.Request) bool {
+		return isAllowedOrigin(r, r.Header.Get("Origin"))
+	},
 }
 
 // handleStream upgrades the connection to WebSocket and streams synthetic

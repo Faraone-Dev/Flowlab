@@ -1,4 +1,4 @@
-module github.com/IvanPiardi/flowlab/api
+module github.com/Faraone-Dev/flowlab/api
 
 go 1.22
 

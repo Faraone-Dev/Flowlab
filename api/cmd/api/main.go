@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/IvanPiardi/flowlab/api/server"
+	"github.com/Faraone-Dev/flowlab/api/server"
 )
 
 func main() {

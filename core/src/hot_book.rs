@@ -760,8 +760,11 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         let cnt = *count as usize;
         if let Some(i) = Self::find_level(levels, cnt, price, is_bid) {
             levels[i].total_qty = levels[i].total_qty.saturating_sub(qty);
-            if levels[i].order_count == 0 {
-                Self::remove_level(levels, count, i);
+            if levels[i].total_qty == 0 {
+                levels[i].order_count = levels[i].order_count.saturating_sub(1);
+                if levels[i].order_count == 0 {
+                    Self::remove_level(levels, count, i);
+                }
             }
             return true;
         }
@@ -856,6 +859,16 @@ mod tests {
         let mut book = HotOrderBook::<64>::new(1);
         book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100, 10));
         book.apply(&make_event(EventType::OrderCancel, Side::Bid, 100, 10));
+
+        assert_eq!(book.bid_count(), 0);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_anon_trade_full_fill_removes_level() {
+        let mut book = HotOrderBook::<64>::new(1);
+        book.apply(&make_event(EventType::OrderAdd, Side::Bid, 100, 10));
+        book.apply(&make_event(EventType::Trade, Side::Bid, 100, 10));
 
         assert_eq!(book.bid_count(), 0);
         assert_eq!(book.best_bid(), None);
