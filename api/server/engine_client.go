@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+const (
+	minSupportedWireVersion uint16 = 1
+	maxSupportedWireVersion uint16 = 2
+)
+
 // Feed is the surface the WS handler depends on. Both SyntheticFeed and
 // EngineClient satisfy it, so the server can be flipped between modes
 // with a single CLI flag and the dashboard contract stays untouched.
@@ -250,11 +255,20 @@ func (c *EngineClient) runOnce() error {
 		}
 		// version (u16 LE)
 		ver := binary.LittleEndian.Uint16(buf[:2])
-		if ver != 1 {
-			return fmt.Errorf("unsupported wire version: %d (expected 1)", ver)
+		if !isSupportedWireVersion(ver) {
+			return fmt.Errorf(
+				"unsupported wire version: %d (supported %d..%d)",
+				ver,
+				minSupportedWireVersion,
+				maxSupportedWireVersion,
+			)
 		}
 		c.dispatchJSON(buf[2:])
 	}
+}
+
+func isSupportedWireVersion(ver uint16) bool {
+	return ver >= minSupportedWireVersion && ver <= maxSupportedWireVersion
 }
 
 // dispatchJSON peeks at the externally-tagged variant name and decodes

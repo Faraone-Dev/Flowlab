@@ -10,7 +10,7 @@
 //! ```
 //!
 //! `len`     = bytes of `version + payload` (NOT including the u32 itself)
-//! `version` = wire protocol version. v1 = first release.
+//! `version` = wire protocol version. Current release = v2.
 //! `payload` = bincode-encoded `TelemetryFrame`, or JSON if `--wire=json`.
 //!
 //! Versioning rule: any breaking change to `TelemetryFrame` (field rename,
@@ -28,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_VERSION: u16 = 2;
 
 /// Top-level telemetry frame. Exhaustive enum so consumers can match.
 #[derive(Debug, Clone, Serialize, Deserialize)]
