@@ -243,6 +243,157 @@ impl StormGenerator for PhantomLiquidityGenerator {
     }
 }
 
+pub struct QuoteStuffGenerator {
+    rng: DetRng,
+    base_price: u64,
+    next_oid: u64,
+    bursts_remaining: u32,
+    trades_per_step: u32,
+    cancels_per_trade: u32,
+    step_period_ns: u64,
+    next_due: u64,
+}
+
+impl QuoteStuffGenerator {
+    pub fn new(seed: u64, severity: f32, base_price: u64, bursts: u32) -> Self {
+        Self {
+            rng: DetRng::new(seed ^ 0xB1B1_B1B1_B1B1_B1B1),
+            base_price,
+            next_oid: 1_500_000,
+            bursts_remaining: bursts,
+            trades_per_step: lerp(severity, 4.0, 6.0).round() as u32,
+            cancels_per_trade: lerp(severity, 8.0, 16.0).round() as u32,
+            step_period_ns: lerp(severity, 20_000_000.0, 5_000_000.0) as u64,
+            next_due: 0,
+        }
+    }
+}
+
+impl StormGenerator for QuoteStuffGenerator {
+    fn step(&mut self, now_ns: u64, base_seq: u64) -> Vec<SequencedEvent> {
+        let total = self.trades_per_step.saturating_mul(self.cancels_per_trade + 1);
+        let mut out = Vec::with_capacity(total as usize);
+        let mut seq = base_seq;
+        let mut ts = now_ns;
+        let dt = self.step_period_ns / total.max(1) as u64;
+
+        for i in 0..self.trades_per_step {
+            let trade_side = if i % 2 == 0 { Side::Ask } else { Side::Bid };
+            let trade_price = if matches!(trade_side, Side::Ask) {
+                self.base_price.saturating_add(1)
+            } else {
+                self.base_price.saturating_sub(1)
+            };
+            out.push(mk(seq, ts, EventType::Trade, trade_side, trade_price, 100, self.next_oid));
+            self.next_oid = self.next_oid.wrapping_add(1);
+            seq += 1;
+            ts = ts.saturating_add(dt);
+
+            let cancel_side = if matches!(trade_side, Side::Ask) { Side::Bid } else { Side::Ask };
+            for _ in 0..self.cancels_per_trade {
+                let off = 1 + self.rng.next_below(4);
+                let price = if matches!(cancel_side, Side::Bid) {
+                    self.base_price.saturating_sub(off)
+                } else {
+                    self.base_price.saturating_add(off)
+                };
+                out.push(mk(seq, ts, EventType::OrderCancel, cancel_side, price, 100, self.next_oid));
+                self.next_oid = self.next_oid.wrapping_add(1);
+                seq += 1;
+                ts = ts.saturating_add(dt);
+            }
+        }
+
+        self.bursts_remaining = self.bursts_remaining.saturating_sub(1);
+        self.next_due = now_ns.saturating_add(self.step_period_ns);
+        out
+    }
+
+    fn next_due_ns(&self) -> u64 {
+        self.next_due
+    }
+
+    fn finished(&self) -> bool {
+        self.bursts_remaining == 0
+    }
+
+    fn kind_label(&self) -> &'static str {
+        "quote_stuff"
+    }
+}
+
+pub struct SpoofGenerator {
+    rng: DetRng,
+    base_price: u64,
+    next_oid: u64,
+    cycles_per_step: u32,
+    step_period_ns: u64,
+    next_due: u64,
+    cycles_remaining: u32,
+    add_cancel_gap_ns: u64,
+    qty: u64,
+}
+
+impl SpoofGenerator {
+    pub fn new(seed: u64, severity: f32, base_price: u64, total_cycles: u32) -> Self {
+        Self {
+            rng: DetRng::new(seed ^ 0xD1D1_D1D1_D1D1_D1D1),
+            base_price,
+            next_oid: 1_750_000,
+            cycles_per_step: lerp(severity, 1.0, 6.0).round() as u32,
+            step_period_ns: lerp(severity, 25_000_000.0, 5_000_000.0) as u64,
+            next_due: 0,
+            cycles_remaining: total_cycles,
+            add_cancel_gap_ns: lerp(severity, 1_000_000.0, 50_000.0) as u64,
+            qty: lerp(severity, 2_000.0, 20_000.0) as u64,
+        }
+    }
+}
+
+impl StormGenerator for SpoofGenerator {
+    fn step(&mut self, now_ns: u64, base_seq: u64) -> Vec<SequencedEvent> {
+        let cycles = self.cycles_per_step.min(self.cycles_remaining);
+        let mut out = Vec::with_capacity((cycles * 2) as usize);
+        let mut seq = base_seq;
+        let mut ts = now_ns;
+
+        for _ in 0..cycles {
+            let side = if self.rng.bool_p(0.5) { Side::Bid } else { Side::Ask };
+            let off = 1 + self.rng.next_below(4);
+            let price = if matches!(side, Side::Bid) {
+                self.base_price.saturating_sub(off)
+            } else {
+                self.base_price.saturating_add(off)
+            };
+            let oid = self.next_oid;
+            self.next_oid = self.next_oid.wrapping_add(1);
+
+            out.push(mk(seq, ts, EventType::OrderAdd, side, price, self.qty, oid));
+            seq += 1;
+            ts = ts.saturating_add(self.add_cancel_gap_ns / 2);
+            out.push(mk(seq, ts, EventType::OrderCancel, side, price, self.qty, oid));
+            seq += 1;
+            ts = ts.saturating_add(self.add_cancel_gap_ns / 2);
+        }
+
+        self.cycles_remaining = self.cycles_remaining.saturating_sub(cycles);
+        self.next_due = now_ns.saturating_add(self.step_period_ns);
+        out
+    }
+
+    fn next_due_ns(&self) -> u64 {
+        self.next_due
+    }
+
+    fn finished(&self) -> bool {
+        self.cycles_remaining == 0
+    }
+
+    fn kind_label(&self) -> &'static str {
+        "spoof"
+    }
+}
+
 // ─── 2. CancellationStormGenerator ───────────────────────────────────
 //
 // Detector spec (chaos/src/cancellation_storm.rs):
@@ -909,6 +1060,7 @@ impl StormGenerator for LatencyArbProxyGenerator {
 mod tests {
     use super::*;
     use crate::cancellation_storm::CancellationStormDetector;
+    use crate::detection::{QuoteStuffDetector, SpoofDetector};
     use crate::flash_crash::FlashCrashDetector;
     use crate::latency_arb_proxy::LatencyArbProxyDetector;
     use crate::momentum_ignition::MomentumIgnitionDetector;
@@ -952,6 +1104,36 @@ mod tests {
             }
         }
         assert!(hits >= 4, "expected >=4 phantom flags, got {hits}");
+    }
+
+    #[test]
+    fn quote_stuff_generator_fires_quote_stuff_detector() {
+        let g = QuoteStuffGenerator::new(0xAAA5, 0.9, 100_000, 2);
+        let stream = run(g, 4);
+        let mut det = QuoteStuffDetector::new(48, 8.0);
+        let mut hits = 0;
+        for ev in &stream {
+            if let Some(e) = det.process(ev) {
+                assert_eq!(e.kind, ChaosKind::QuoteStuff);
+                hits += 1;
+            }
+        }
+        assert!(hits >= 1, "expected quote-stuff flag, got {hits}");
+    }
+
+    #[test]
+    fn spoof_generator_fires_spoof_detector() {
+        let g = SpoofGenerator::new(0xAAA6, 0.9, 100_000, 4);
+        let stream = run(g, 8);
+        let mut det = SpoofDetector::new(1_000, 64);
+        let mut hits = 0;
+        for ev in &stream {
+            if let Some(e) = det.process(ev) {
+                assert_eq!(e.kind, ChaosKind::Spoof);
+                hits += 1;
+            }
+        }
+        assert!(hits >= 1, "expected spoof flag, got {hits}");
     }
 
     #[test]

@@ -6,16 +6,19 @@ pub mod flash_crash;
 pub mod generators;
 pub mod latency_arb_proxy;
 pub mod momentum_ignition;
+mod order_tracker;
 pub mod phantom_liquidity;
 pub mod storm;
 pub mod window;
 
 pub use cancellation_storm::CancellationStormDetector;
 pub use chain::ChaosChain;
+pub use detection::{QuoteStuffDetector, SpoofDetector};
 pub use flash_crash::FlashCrashDetector;
 pub use generators::{
     CancellationStormGenerator, DetRng, FlashCrashGenerator, LatencyArbProxyGenerator,
-    MomentumIgnitionGenerator, PhantomLiquidityGenerator, StormGenerator,
+    MomentumIgnitionGenerator, PhantomLiquidityGenerator, QuoteStuffGenerator,
+    SpoofGenerator, StormGenerator,
 };
 pub use latency_arb_proxy::LatencyArbProxyDetector;
 pub use momentum_ignition::MomentumIgnitionDetector;

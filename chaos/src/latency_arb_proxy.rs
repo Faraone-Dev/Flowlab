@@ -45,6 +45,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use flowlab_core::event::{EventType, SequencedEvent};
 
+use crate::order_tracker::{AggressorSide, OrderTracker, ResolvedTrade};
 use crate::{ChaosEvent, ChaosFeatures, ChaosKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,7 @@ struct PendingTrigger {
 pub struct LatencyArbProxyDetector {
     bids: BTreeMap<u64, u64>,
     asks: BTreeMap<u64, u64>,
+    order_tracker: OrderTracker,
     max_book_levels: usize,
 
     pending: VecDeque<PendingTrigger>,
@@ -125,6 +127,7 @@ impl LatencyArbProxyDetector {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            order_tracker: OrderTracker::new(),
             max_book_levels,
             pending: VecDeque::with_capacity(16),
             reaction_seq,
@@ -160,48 +163,57 @@ impl LatencyArbProxyDetector {
         let etype = EventType::from_u8(event.event_type)?;
 
         let mid_before = self.midprice();
+        let mut resolved_trade: Option<ResolvedTrade> = None;
 
-        // 1. Mutate the mini-book.
         match etype {
-            EventType::OrderAdd => self.add_qty(event.side, event.price, event.qty),
-            EventType::OrderCancel => self.sub_qty(event.side, event.price, event.qty),
+            EventType::OrderAdd => {
+                if let Some(update) = self.order_tracker.on_add(event) {
+                    self.add_qty(update.side, update.price, update.qty);
+                }
+            }
+            EventType::OrderCancel => {
+                if let Some(update) = self.order_tracker.on_cancel(event) {
+                    self.sub_qty(update.side, update.price, update.qty);
+                }
+            }
             EventType::OrderModify => {}
-            EventType::Trade => self.sub_qty(event.side, event.price, event.qty),
+            EventType::Trade => {
+                if let Some(trade) = self.order_tracker.on_trade(event) {
+                    self.sub_qty(trade.update.side, trade.update.price, trade.update.qty);
+                    resolved_trade = Some(trade);
+                }
+            }
             EventType::BookSnapshot => return None,
         }
 
         let in_refractory = seq_event.seq < self.refractory_until;
 
-        // 2. Seed a new trigger on a qualifying trade.
-        if etype == EventType::Trade && !in_refractory && event.qty >= self.min_trade_qty {
-            if let Some(m) = mid_before {
-                let dir = if event.price >= m {
-                    TakerDir::Buy
-                } else {
-                    TakerDir::Sell
-                };
-                self.pending.push_back(PendingTrigger {
-                    seq: seq_event.seq,
-                    ts: event.ts,
-                    price: event.price,
-                    qty: event.qty,
-                    dir,
-                    mid_at_trade: m,
-                    burst_count: 0,
-                    last_burst_seq: seq_event.seq,
-                    last_burst_ts: event.ts,
-                    burst_qualified: false,
-                });
-                // Bound the pending queue. Old triggers are evicted by
-                // window expiry below, but cap for hard safety.
-                if self.pending.len() > 64 {
-                    self.pending.pop_front();
+        if !in_refractory {
+            if let (Some(trade), Some(m)) = (resolved_trade, mid_before) {
+                if trade.update.qty >= self.min_trade_qty {
+                    let dir = match trade.aggressor {
+                        AggressorSide::Buy => TakerDir::Buy,
+                        AggressorSide::Sell => TakerDir::Sell,
+                    };
+                    self.pending.push_back(PendingTrigger {
+                        seq: seq_event.seq,
+                        ts: event.ts,
+                        price: trade.update.price,
+                        qty: trade.update.qty,
+                        dir,
+                        mid_at_trade: m,
+                        burst_count: 0,
+                        last_burst_seq: seq_event.seq,
+                        last_burst_ts: event.ts,
+                        burst_qualified: false,
+                    });
+                    if self.pending.len() > 64 {
+                        self.pending.pop_front();
+                    }
                 }
             }
         }
 
-        // 3. For each pending trigger: contribute to its burst, then
-        //    evaluate window expiry / qualification / reversion.
         let mut flag: Option<ChaosEvent> = None;
         let mut keep: VecDeque<PendingTrigger> =
             VecDeque::with_capacity(self.pending.len());
@@ -340,7 +352,8 @@ impl LatencyArbProxyDetector {
     fn sub_qty(&mut self, side: u8, price: u64, qty: u64) {
         let book = self.book_mut(side);
         if let Some(entry) = book.get_mut(&price) {
-            *entry = entry.saturating_sub(qty.max(1));
+            let take = if qty == 0 { *entry } else { qty.min(*entry) };
+            *entry -= take;
             if *entry == 0 {
                 book.remove(&price);
             }
@@ -389,6 +402,31 @@ mod tests {
                 price,
                 qty,
                 order_id: seq,
+                instrument_id: 1,
+                event_type: etype as u8,
+                side: side as u8,
+                _pad: [0; 2],
+            },
+        }
+    }
+
+    fn ev_oid(
+        seq: u64,
+        ts: u64,
+        etype: EventType,
+        side: ESide,
+        price: u64,
+        qty: u64,
+        order_id: u64,
+    ) -> SequencedEvent {
+        SequencedEvent {
+            seq,
+            channel_id: 0,
+            event: Event {
+                ts,
+                price,
+                qty,
+                order_id,
                 instrument_id: 1,
                 event_type: etype as u8,
                 side: side as u8,
@@ -560,6 +598,25 @@ mod tests {
             }
         }
         assert_eq!(hits, 1, "cooldown must suppress second proxy (got {hits})");
+    }
+
+    #[test]
+    fn raw_trade_seeds_trigger_from_order_id() {
+        let mut det = LatencyArbProxyDetector::new(50, 0, 32, 5, 50, 3, false, 0, 200);
+        det.process(&ev_oid(1, 1_000, EventType::OrderAdd, ESide::Bid, 9_999, 100, 11));
+        det.process(&ev_oid(2, 2_000, EventType::OrderAdd, ESide::Bid, 9_998, 100, 12));
+        det.process(&ev_oid(3, 3_000, EventType::OrderAdd, ESide::Bid, 9_997, 100, 13));
+        det.process(&ev_oid(4, 4_000, EventType::OrderAdd, ESide::Ask, 10_001, 100, 21));
+
+        let mut hits = 0;
+        det.process(&ev_oid(5, 5_000, EventType::Trade, ESide::Bid, 0, 100, 21));
+        for (seq, price) in [(6, 9_999), (7, 9_998), (8, 9_997)] {
+            if det.process(&ev(seq, seq * 1_000, EventType::OrderCancel, ESide::Bid, price, 50)).is_some() {
+                hits += 1;
+            }
+        }
+
+        assert_eq!(hits, 1);
     }
 
     // ─── Property tests ──────────────────────────────────────────────

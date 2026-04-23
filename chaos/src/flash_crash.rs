@@ -63,6 +63,7 @@ use std::collections::BTreeMap;
 
 use flowlab_core::event::{EventType, SequencedEvent};
 
+use crate::order_tracker::{AggressorSide, OrderTracker};
 use crate::{ChaosEvent, ChaosFeatures, ChaosKind};
 
 /// Maximum supported `gap_window_events`. Detectors built with a
@@ -95,6 +96,7 @@ enum CrashDir {
 pub struct FlashCrashDetector {
     bids: BTreeMap<u64, u64>,
     asks: BTreeMap<u64, u64>,
+    order_tracker: OrderTracker,
     max_book_levels: usize,
 
     /// Cached best bid / best ask. Updated *incrementally* on every
@@ -170,6 +172,7 @@ impl FlashCrashDetector {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            order_tracker: OrderTracker::new(),
             max_book_levels,
             cached_bb: None,
             cached_ba: None,
@@ -257,24 +260,29 @@ impl FlashCrashDetector {
             self.push_snap(snap);
         }
 
-        // 2. Update aggression counters from trades, classified against
-        //    `mid_before` (tick rule).
-        if etype == EventType::Trade {
-            if let Some(m) = mid_before {
-                if event.price >= m {
-                    self.buy_aggr = self.buy_aggr.saturating_add(1);
-                } else {
-                    self.sell_aggr = self.sell_aggr.saturating_add(1);
+        match etype {
+            EventType::OrderAdd => {
+                if let Some(update) = self.order_tracker.on_add(event) {
+                    self.add_qty(update.side, update.price, update.qty);
                 }
             }
-        }
-
-        // 3. Mutate the mini-book.
-        match etype {
-            EventType::OrderAdd => self.add_qty(event.side, event.price, event.qty),
-            EventType::OrderCancel => self.sub_qty(event.side, event.price, event.qty),
-            EventType::OrderModify => {} // see momentum_ignition.rs note
-            EventType::Trade => self.sub_qty(event.side, event.price, event.qty),
+            EventType::OrderCancel => {
+                if let Some(update) = self.order_tracker.on_cancel(event) {
+                    self.sub_qty(update.side, update.price, update.qty);
+                }
+            }
+            EventType::OrderModify => {}
+            EventType::Trade => {
+                if let Some(trade) = self.order_tracker.on_trade(event) {
+                    match trade.aggressor {
+                        AggressorSide::Buy => self.buy_aggr = self.buy_aggr.saturating_add(1),
+                        AggressorSide::Sell => {
+                            self.sell_aggr = self.sell_aggr.saturating_add(1)
+                        }
+                    }
+                    self.sub_qty(trade.update.side, trade.update.price, trade.update.qty);
+                }
+            }
             EventType::BookSnapshot => return None,
         }
 
@@ -458,7 +466,7 @@ impl FlashCrashDetector {
         let mut level_emptied = false;
         let book = self.book_mut(side);
         if let Some(entry) = book.get_mut(&price) {
-            let take = qty.max(1).min(*entry);
+            let take = if qty == 0 { *entry } else { qty.min(*entry) };
             *entry -= take;
             removed = take;
             if *entry == 0 {
@@ -569,6 +577,31 @@ mod tests {
                 price,
                 qty,
                 order_id: seq,
+                instrument_id: 1,
+                event_type: etype as u8,
+                side: side as u8,
+                _pad: [0; 2],
+            },
+        }
+    }
+
+    fn ev_oid(
+        seq: u64,
+        ts: u64,
+        etype: EventType,
+        side: Side,
+        price: u64,
+        qty: u64,
+        order_id: u64,
+    ) -> SequencedEvent {
+        SequencedEvent {
+            seq,
+            channel_id: 0,
+            event: Event {
+                ts,
+                price,
+                qty,
+                order_id,
                 instrument_id: 1,
                 event_type: etype as u8,
                 side: side as u8,
@@ -732,6 +765,19 @@ mod tests {
             hits += 1;
         }
         assert_eq!(hits, 1, "cooldown must suppress second crash (got {hits})");
+    }
+
+    #[test]
+    fn raw_delete_resolves_order_id_and_qty_zero() {
+        let mut det = FlashCrashDetector::new(5, 2, 16, 5, 0.3, 1, 200);
+        det.process(&ev_oid(1, 1_000, EventType::OrderAdd, Side::Bid, 9_999, 100, 11));
+        det.process(&ev_oid(2, 2_000, EventType::OrderAdd, Side::Ask, 10_001, 100, 22));
+
+        assert_eq!(det.best_bid(), Some(9_999));
+
+        det.process(&ev_oid(3, 3_000, EventType::OrderCancel, Side::Ask, 0, 0, 11));
+
+        assert_eq!(det.best_bid(), None);
     }
 
     // ─── Property tests ──────────────────────────────────────────────

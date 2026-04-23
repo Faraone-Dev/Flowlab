@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use flowlab_core::event::{EventType, SequencedEvent};
 
+use crate::order_tracker::{AggressorSide, OrderTracker};
 use crate::{ChaosEvent, ChaosFeatures, ChaosKind};
 
 /// Direction of the current detected drift.
@@ -73,6 +74,7 @@ pub struct MomentumIgnitionDetector {
     bids: BTreeMap<u64, u64>,
     /// Ask side mini-book (price -> aggregated qty).
     asks: BTreeMap<u64, u64>,
+    order_tracker: OrderTracker,
     /// Cap on tracked levels per side. Levels farthest from best are
     /// evicted when exceeded.
     max_book_levels: usize,
@@ -129,6 +131,7 @@ impl MomentumIgnitionDetector {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            order_tracker: OrderTracker::new(),
             max_book_levels,
             mids: VecDeque::with_capacity(256),
             buy_pressure: 0,
@@ -187,35 +190,26 @@ impl MomentumIgnitionDetector {
         let event = &seq_event.event;
         let etype = EventType::from_u8(event.event_type)?;
 
-        // Snapshot mid BEFORE applying the event so we can classify
-        // aggression of trades against the prevailing mid.
-        let mid_before = self.midprice();
-
-        // Mutate the mini-book.
         match etype {
             EventType::OrderAdd => {
-                self.add_qty(event.side, event.price, event.qty);
+                if let Some(update) = self.order_tracker.on_add(event) {
+                    self.add_qty(update.side, update.price, update.qty);
+                }
             }
             EventType::OrderCancel => {
-                self.sub_qty(event.side, event.price, event.qty);
+                if let Some(update) = self.order_tracker.on_cancel(event) {
+                    self.sub_qty(update.side, update.price, update.qty);
+                }
             }
             EventType::OrderModify => {
-                // Without per-order qty memory we cannot perfectly
-                // reflect a modify on the aggregated book. Treat it as
-                // a no-op for the mini-book (best/ask rarely move on
-                // pure modifies in practice) but still let it
-                // contribute to the trade-pressure update path below.
             }
             EventType::Trade => {
-                // Trades remove qty from the resting side. ITCH `side`
-                // semantics: the side of the resting order being hit.
-                self.sub_qty(event.side, event.price, event.qty);
-                self.trades_in_window += 1;
-                if let Some(m) = mid_before {
-                    if event.price >= m {
-                        self.buy_pressure += 1;
-                    } else {
-                        self.sell_pressure += 1;
+                if let Some(trade) = self.order_tracker.on_trade(event) {
+                    self.sub_qty(trade.update.side, trade.update.price, trade.update.qty);
+                    self.trades_in_window += 1;
+                    match trade.aggressor {
+                        AggressorSide::Buy => self.buy_pressure += 1,
+                        AggressorSide::Sell => self.sell_pressure += 1,
                     }
                 }
             }
@@ -402,7 +396,8 @@ impl MomentumIgnitionDetector {
     fn sub_qty(&mut self, side: u8, price: u64, qty: u64) {
         let book = self.book_mut(side);
         if let Some(entry) = book.get_mut(&price) {
-            *entry = entry.saturating_sub(qty.max(1));
+            let take = if qty == 0 { *entry } else { qty.min(*entry) };
+            *entry -= take;
             if *entry == 0 {
                 book.remove(&price);
             }
@@ -475,6 +470,31 @@ mod tests {
                 price,
                 qty,
                 order_id: seq,
+                instrument_id: 1,
+                event_type: etype as u8,
+                side: side as u8,
+                _pad: [0; 2],
+            },
+        }
+    }
+
+    fn ev_oid(
+        seq: u64,
+        ts: u64,
+        etype: EventType,
+        side: Side,
+        price: u64,
+        qty: u64,
+        order_id: u64,
+    ) -> SequencedEvent {
+        SequencedEvent {
+            seq,
+            channel_id: 0,
+            event: Event {
+                ts,
+                price,
+                qty,
+                order_id,
                 instrument_id: 1,
                 event_type: etype as u8,
                 side: side as u8,
@@ -638,6 +658,19 @@ mod tests {
         // (best_bid is largest tracked, best_ask is smallest tracked).
         assert_eq!(det.best_bid(), Some(9_999));
         assert_eq!(det.best_ask(), Some(10_001));
+    }
+
+    #[test]
+    fn raw_trade_resolves_order_id_and_price() {
+        let mut det = MomentumIgnitionDetector::new(500, 0, 16, 1, 1, 1, 200);
+        det.process(&ev_oid(1, 1_000, EventType::OrderAdd, Side::Bid, 9_999, 100, 11));
+        det.process(&ev_oid(2, 2_000, EventType::OrderAdd, Side::Ask, 10_001, 100, 22));
+
+        assert_eq!(det.best_ask(), Some(10_001));
+
+        det.process(&ev_oid(3, 3_000, EventType::Trade, Side::Bid, 0, 100, 22));
+
+        assert_eq!(det.best_ask(), None);
     }
 
     // ─── Property tests ──────────────────────────────────────────────

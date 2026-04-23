@@ -16,9 +16,8 @@
 //! ```
 //!
 //! Segment files are named `wal-<u64>.log`, numbered from 0 and
-//! rotated when they exceed the configured segment size. A writer
-//! crash between header and payload leaves a torn tail which is
-//! transparently skipped by the reader (truncation-tolerant).
+//! rotated when they exceed the configured segment size. A torn tail
+//! is truncated on reopen so the next append resumes from a clean EOF.
 //!
 //! Durability model:
 //! - `append`: buffered write, O(1)
@@ -75,8 +74,8 @@ impl Wal {
         let (index, file, bytes) = match segments.last().copied() {
             Some(idx) => {
                 let path = segment_path(&dir, idx);
+                let bytes = recover_segment_tail(&path)?;
                 let file = OpenOptions::new().append(true).read(true).open(&path)?;
-                let bytes = file.metadata()?.len();
                 (idx, file, bytes)
             }
             None => {
@@ -86,6 +85,7 @@ impl Wal {
                     .write(true)
                     .read(true)
                     .open(&path)?;
+                sync_dir(&dir)?;
                 (0u64, file, 0u64)
             }
         };
@@ -128,13 +128,13 @@ impl Wal {
     /// Flush + fsync to disk. Use after every must-survive-crash boundary.
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
     fn rotate(&mut self) -> Result<(), WalError> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        self.writer.get_ref().sync_all()?;
         self.current_index += 1;
         let path = segment_path(&self.dir, self.current_index);
         let file = OpenOptions::new()
@@ -142,6 +142,7 @@ impl Wal {
             .write(true)
             .read(true)
             .open(&path)?;
+        sync_dir(&self.dir)?;
         self.writer = BufWriter::with_capacity(1 << 20, file);
         self.current_bytes = 0;
         Ok(())
@@ -173,6 +174,53 @@ fn list_segments(dir: &Path) -> Result<Vec<u64>, WalError> {
         }
     }
     Ok(out)
+}
+
+fn recover_segment_tail(path: &Path) -> Result<u64, WalError> {
+    let mut file = File::open(path)?;
+    let mut offset = 0u64;
+
+    loop {
+        let mut hdr = [0u8; MAGIC_HEADER];
+        match file.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+
+        let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        let crc = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let mut payload = vec![0u8; len];
+        match file.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        if crc32(&payload) != crc {
+            break;
+        }
+        offset += MAGIC_HEADER as u64 + len as u64;
+    }
+
+    let file_len = file.metadata()?.len();
+    drop(file);
+    if offset < file_len {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(offset)?;
+        file.sync_all()?;
+    }
+    Ok(offset)
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<(), WalError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<(), WalError> {
+    Ok(())
 }
 
 /// Streaming reader: iterates records across all segments in order,
@@ -377,7 +425,7 @@ mod tests {
 
         // Simulate a crash: truncate the last record's payload.
         let seg = segment_path(&dir, 0);
-        let mut f = OpenOptions::new().write(true).open(&seg).unwrap();
+        let f = OpenOptions::new().write(true).open(&seg).unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 16).unwrap(); // drop 16 bytes of the last payload
         drop(f);
@@ -395,6 +443,34 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 9, "expected 9 intact records before torn tail");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopen_truncates_torn_tail_before_append() {
+        let dir = tmp_dir("recover");
+        let mut wal = Wal::open_or_create(&dir, 1 << 20).unwrap();
+        wal.append(&[1u8; 32]).unwrap();
+        wal.append(&[2u8; 32]).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let seg = segment_path(&dir, 0);
+        let file = OpenOptions::new().write(true).open(&seg).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len - 16).unwrap();
+        drop(file);
+
+        let mut wal = Wal::open_or_create(&dir, 1 << 20).unwrap();
+        wal.append(&[3u8; 32]).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let mut reader = WalReader::open(&dir).unwrap();
+        assert_eq!(reader.next_record().unwrap().unwrap(), &[1u8; 32]);
+        assert_eq!(reader.next_record().unwrap().unwrap(), &[3u8; 32]);
+        assert!(reader.next_record().unwrap().is_none());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

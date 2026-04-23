@@ -2,7 +2,8 @@ use flowlab_core::event::SequencedEvent;
 
 use crate::generators::{
     CancellationStormGenerator, FlashCrashGenerator, LatencyArbProxyGenerator,
-    MomentumIgnitionGenerator, PhantomLiquidityGenerator, StormGenerator,
+    MomentumIgnitionGenerator, PhantomLiquidityGenerator, QuoteStuffGenerator,
+    SpoofGenerator, StormGenerator,
 };
 use crate::ChaosKind;
 
@@ -201,7 +202,13 @@ fn spawn_generator(spec: StormSpec, base_price: u64, restart: u32) -> Box<dyn St
             base_price,
             cycles_from_duration(spec.duration_ns, 40_000_000, 1),
         )),
-        ChaosKind::QuoteStuff | ChaosKind::Spoof => Box::new(PhantomLiquidityGenerator::new(
+        ChaosKind::QuoteStuff => Box::new(QuoteStuffGenerator::new(
+            seed,
+            spec.severity,
+            base_price,
+            cycles_from_duration(spec.duration_ns, 10_000_000, 1),
+        )),
+        ChaosKind::Spoof => Box::new(SpoofGenerator::new(
             seed,
             spec.severity,
             base_price,
