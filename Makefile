@@ -58,12 +58,6 @@ bench:
 bench-replay:
 	cargo bench --bench replay
 
-bench-hotpath:
-	@echo "TODO: C++ benchmark harness"
-
-bench-feed:
-	@echo "TODO: Zig feed parser benchmark"
-
 # ─── Clean ────────────────────────────────────────────────────────
 
 ifeq ($(OS),Windows_NT)

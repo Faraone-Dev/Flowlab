@@ -3,7 +3,7 @@
 **Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
 Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go control plane &nbsp;|&nbsp;
-134 tests (122 Rust + 12 Zig) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
+150 tests (128 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
 MoldUDP64 + WAL + SPSC mmap ring &nbsp;|&nbsp; Rust↔Zig↔C++ canonical L2 hash bit-identical &nbsp;|&nbsp;
 6-guard fail-closed risk gate &nbsp;|&nbsp;
 React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
@@ -25,25 +25,25 @@ byte-for-byte, across runs and platforms.
 
 ---
 
-## Posizionamento
+## Positioning
 
-**flowlab è il livello deterministico di dati e analytics su cui poggia
-uno stack di ricerca HFT, non lo stack di trading completo.**
+**flowlab is the deterministic data + analytics substrate an HFT
+research stack sits on top of — it is not the full trading stack.**
 
-Quattro linguaggi, una sola verità: Rust possiede lo state machine,
-Zig il parser, C++ i kernel caldi, Go l'I/O. Le invarianti
-cross-implementation — canonical L2 hash bit-identical, Event ABI da
-40 B, analytics replay-stable, WAL con halt deterministico sui gap —
-sono validate in CI, non assunte.
+Four languages, one source of truth: Rust owns the state machine, Zig
+owns the parser, C++ owns the hot kernels, Go owns I/O. The
+cross-implementation invariants — canonical L2 hash bit-identical,
+40 B Event ABI, replay-stable analytics, deterministic WAL halt on
+gaps — are validated in CI, not assumed.
 
-Lo scope è una scelta precisa. Uno stack di strategia serio ha
-bisogno di un substrato riproducibile **prima** di matching engine,
-fill model e queue tracking. Quei layer sono volutamente fuori dal
-perimetro: dipendono da assunzioni venue-specific (NASDAQ ITCH vs
-CME MDP3 vs CBOE PITCH) e da informazioni proprietarie (queue
-position, fill probability, market impact) che non devono contaminare
-la base. flowlab fornisce le primitive su cui un layer di matching
-coerente può essere costruito; non finge di essere quel layer.
+The scope is a deliberate choice. A serious strategy stack needs a
+reproducible substrate **before** matching engine, fill model and
+queue tracking. Those layers are intentionally out of perimeter: they
+depend on venue-specific assumptions (NASDAQ ITCH vs CME MDP3 vs CBOE
+PITCH) and on proprietary information (queue position, fill
+probability, market impact) that must not contaminate the base.
+flowlab provides the primitives a coherent matching layer can be
+built on; it does not pretend to be that layer.
 
 ---
 
@@ -144,7 +144,7 @@ and re-broadcasts it as JSON over WebSocket to a React/uPlot dashboard.
 
 ```
 flowlab-engine (Rust, :9090)
-    ├── Source         : synthetic | ich (WIP) | binance (WIP)
+    ├── Source         : synthetic | itch
     ├── Pipeline       : HotOrderBook + VPIN + spread + imbalance
     ├── Risk gate      : CircuitBreaker (probed for latency)
     ├── Backpressure   : bounded mpsc(8192), drop counter exposed
@@ -289,8 +289,13 @@ target:
   wins: 1
   losses: 3
   win_rate: 0.250
-verdict: TARGET_INTACT     # TARGET_INTACT | TARGET_DAMAGED (<-10) | TARGET_KILLED (<-100)
+verdict: TARGET_DAMAGED    # TARGET_INTACT | TARGET_DAMAGED (<-10) | TARGET_KILLED (<-100)
 ```
+
+> The example above is illustrative — `delta: -2.40` would actually
+> classify as `TARGET_INTACT`. Verdict thresholds (`-10`, `-100`) are
+> calibrated against the bot's own equity scale; recorded runs on
+> [`data/runs/`](data/runs/) include all three outcomes.
 
 `events.jsonl` is the audit trail (`run_start`, `storm_start`,
 `storm_stop`, `target_signal`, `run_stop`). `ticks.jsonl` is a 1 Hz
@@ -559,7 +564,8 @@ flowlab/
 ├── bench/               Rust: criterion benchmarks
 ├── bin/                 Built Go binaries (api server)
 ├── data/                Binary event logs + run artefacts (data/runs/)
-├── docs/                Notes (latency methodology, etc.)
+├── docs/                latency-alpha.md (α optimisation log) +
+│                        latency-cross-hw.md (cross-CPU reproduction)
 ├── run-desk.ps1         One-shot orchestrator (engine + api + dashboard)
 ├── .github/workflows/   CI matrix (Linux + Windows, ±native)
 ├── Cargo.toml           Rust workspace
@@ -611,12 +617,14 @@ cd feed-parser && zig build test --summary all      # Zig unit tests
 cd ingest      && go test -race -count=1 ./...      # Go
 ```
 
-Current passing counts (verified by `cargo test --workspace`):
+Passing counts (verified by `cargo test --workspace` + `zig build
+test` + `go test ./...`): **150 total** = 128 Rust + 12 Zig + 10 Go.
+Breakdown:
 
 | Surface                                       | Tests   |
 | --------------------------------------------- | ------- |
 | `flowlab-chaos` (5 storm injectors + legacy)  | 51      |
-| `flowlab-replay` (unit + integration)         | 31 + 2  |
+| `flowlab-replay` (unit + integration)         | 37 + 2  |
 | `flowlab-e2e` (chaos + e2e + fuzz harnesses)  | 23      |
 | `flowlab-flow` (circuit breaker, analytics)   | 10      |
 | `flowlab-core` (`hot_book`, event, state)     | 8       |
@@ -624,11 +632,8 @@ Current passing counts (verified by `cargo test --workspace`):
 | `flowlab-bench` (cross-impl hash agreement)   | 2       |
 | `flowlab-verify`                              | 1       |
 | Zig `feed-parser` (`itch.zig` + `main.zig`)   | 12      |
-| **Total**                                     | **134** |
-
-Go `ingest/` and `api/` are infra-only (mmap ring producer + control
-plane) and currently have no unit tests; they are exercised end-to-end
-by the Rust replay + cross-impl hash harness.
+| Go `ingest/` (mmap ring + WS feed)            | 6       |
+| Go `api/` (regime parity vs Rust)             | 4       |
 
 ### Test layout
 
@@ -659,7 +664,35 @@ cargo bench -p flowlab-bench --features native      # with C++ + Zig
 All benches use pre-allocated buffers and seeded synthetic streams.
 No I/O inside measured regions.
 
-### Reference numbers (best observed stable run)
+### Hot-path latency (`HotOrderBook::apply`, single-instrument)
+
+Median over 5 consecutive runs, two CPU generations (AMD Ryzen +
+Intel i7), Windows, no kernel tuning, no isolcpus, no HUGE pages.
+`TOTAL p50 = 22 ns` was recorded on **5/5 runs on both boxes** — the
+number is a property of the code, not of the host.
+
+| Metric (STEADY mix + prefetch, 500k events) | Median  | Best    |
+| ------------------------------------------- | ------- | ------- |
+| TOTAL p50                                   | 22 ns   | 22 ns   |
+| TOTAL p99                                   | 88 ns   | 80 ns   |
+| TRADE p50                                   | 28-30 ns| 28 ns   |
+| TRADE p99                                   | 128-144 | 96 ns   |
+| Wall apply-only (500 000 events)            | 17.4 ms | 16.6 ms |
+
+The α optimisation log moved the workload from cache-bound to
+compute-bound: TRADE intrinsic share of the mix p99 went from 25 % to
+73 %. Two changes (`trade()` hot/cold split + `prefetch_event` on
+slab + level grid), zero new `unsafe`, full backwards-compatible
+semantics. A third change (lane-batched `apply_lanes`) was tried,
+proved correct via canonical L2 hash equivalence, and **rejected**
+(+8.8 % wall vs interleaved) — diagnosis kept in the doc.
+
+- Methodology, per-phase histograms, attribution and rejected
+  alternatives → [`docs/latency-alpha.md`](docs/latency-alpha.md)
+- Cross-hardware reproduction (5/5 runs, two CPUs, zero variance on
+  p50) → [`docs/latency-cross-hw.md`](docs/latency-cross-hw.md)
+
+### Reference numbers — parsing + full pipeline (best observed stable run)
 
 | Bench                | Time           | Throughput        |
 | -------------------- | -------------- | ----------------- |
