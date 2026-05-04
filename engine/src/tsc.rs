@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Sub-nanosecond hot-path clock based on `rdtsc`.
 //!
 //! `Instant::now()` on Windows resolves to QueryPerformanceCounter,

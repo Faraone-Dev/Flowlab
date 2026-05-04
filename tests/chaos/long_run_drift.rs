@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Chaos #3 — Long-run drift (10 M+ events).
 //!
 //! WHAT IT PROVES

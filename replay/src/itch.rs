@@ -1,19 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! NASDAQ ITCH 5.0 — Rust reference parser + synthetic stream generator.
 //!
-//! The parser logic mirrors `feed-parser/src/itch.zig` byte-for-byte so the
-//! integration benchmark can validate end-to-end correctness without
-//! requiring the Zig static library at build time.
+//! Mirrors `feed-parser/src/itch.zig` byte-for-byte so the integration
+//! benchmark validates end-to-end without the Zig static library.
 //!
-//! Message layout (big-endian on the wire):
-//!   'A' AddOrder (no MPID)      36 bytes
-//!   'F' AddOrder (with MPID)    40 bytes
-//!   'D' OrderDelete             19 bytes
-//!   'X' OrderCancel             23 bytes
-//!   'E' OrderExecuted           31 bytes
-//!   'C' OrderExecutedWithPrice  36 bytes
-//!   'U' OrderReplace            35 bytes
-//!   'P' TradeNonCross           44 bytes
-//!   'S' SystemEvent             12 bytes
+//! Message lengths (big-endian wire): 'A' 36, 'F' 40, 'D' 19, 'X' 23,
+//! 'E' 31, 'C' 36, 'U' 35, 'P' 44, 'S' 12, etc. — see `msg_length`.
 
 use flowlab_core::event::{Event, EventType, Side};
 

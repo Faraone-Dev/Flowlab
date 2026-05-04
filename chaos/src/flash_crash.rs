@@ -1,63 +1,16 @@
-//! Flash-crash detector.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! Flash-crash detector. Mid jumps ≥ `min_gap_bps` within
+//! ≤ `gap_window_events` events, top-of-book depth in
+//! `±depth_band_ticks` collapses by ≥ `depth_drop_pct`, confirmed by
+//! ≥ `min_aggr_trades` same-direction aggressors. Mutually exclusive
+//! with MomentumIgnition by window length (1-2 events vs ≥3 samples).
 //!
-//! ## Definition
-//!
-//! A *flash crash* (or flash spike) is a **discontinuous** dislocation
-//! of the top-of-book: midprice jumps by more than `min_gap_bps` over
-//! at most `gap_window_events` consecutive events, accompanied by a
-//! **liquidity vacuum** at the top (aggregate depth within
-//! `depth_band_ticks` of the new best collapsed by at least
-//! `depth_drop_pct` percent vs the pre-event snapshot), and confirmed
-//! by **aggressive trades** in the same direction (>= `min_aggr_trades`
-//! within the same micro-window).
-//!
-//! ## Why this is *not* MomentumIgnition
-//!
-//! MomentumIgnition fires on a *monotone drift* sustained for several
-//! mid samples. FlashCrash fires on a *single sharp jump* (1-2 events)
-//! that simultaneously evaporates the visible book around the new
-//! best. The two detectors are designed to be mutually exclusive by
-//! construction:
-//!
-//!   * Ignition needs `min_consecutive >= 3` mid samples.
-//!   * FlashCrash needs the move to land in `<= gap_window_events`
-//!     events (default 2).
-//!
-//! On the same recording, an event that triggers FlashCrash is too
-//! short to satisfy Ignition's persistence; an event that triggers
-//! Ignition is too gradual to satisfy FlashCrash's gap-window.
-//!
-//! ## Self-contained mini-book
-//!
-//! Same shape as `momentum_ignition::MomentumIgnitionDetector`: a
-//! `BTreeMap<price, qty>` per side, deterministic eviction of the
-//! levels farthest from the best when above `max_book_levels`.
-//!
-//! ## Hot-path optimisation: incremental band depth
-//!
-//! `depth_in_band()` is called on every event (snapshot creation).
-//! A naive implementation (BTreeMap range scan, O(K + log n)) makes
-//! the snapshot stage the dominant cost of the whole chain. Instead
-//! we maintain `band_depth` as a single `u64` updated **incrementally**
-//! on every mutation:
-//!
-//!   * If the mutated price falls inside the current band and best
-//!     did not move -> `band_depth ±= delta_qty` in O(1).
-//!   * If best moved -> we **lazily** invalidate (`band_depth_valid`
-//!     becomes `false`) and the next `depth_in_band()` triggers a
-//!     single O(K) recompute via the BTreeMap range.
-//!
-//! The `depth_in_band_around(bb, ba)` path used by the gap detector
-//! to measure the *original* band's collapse is NOT cached because
-//! it is only called once per fired flag (rare).
-//!
-//! ## Pre-event depth snapshot
-//!
-//! On every successful event we cache the **prior** depth-in-band so
-//! the next event can compute `depth_drop_pct` against the snapshot
-//! that existed *before* the gap. The ring is a fixed-size array of
-//! `SNAP_CAP` slots with a circular head index — no `VecDeque`, no
-//! per-event allocation, no front-pop branch.
+//! Hot-path: `band_depth` is maintained incrementally (O(1) on
+//! in-band mutations, lazy O(K) recompute when best moves). Pre-event
+//! depth snapshots use a fixed `[TopSnapshot; SNAP_CAP=16]` ring — no
+//! VecDeque, no per-event alloc.
 
 use std::collections::BTreeMap;
 
@@ -212,6 +165,11 @@ impl FlashCrashDetector {
     /// Hot path: serves the per-event snapshot. Returns the cached
     /// `band_depth` in O(1) when valid, otherwise triggers a single
     /// O(K) recompute against the BTreeMap and caches the result.
+    ///
+    /// `&mut self` is required for the lazy recompute. Callers inside
+    /// `process()` MUST invoke this only between mutations of the book
+    /// (i.e. after `add_qty`/`sub_qty`), never while holding another
+    /// borrow into `self.bids` / `self.asks`.
     pub fn depth_in_band(&mut self) -> u64 {
         if self.band_depth_valid {
             return self.band_depth;

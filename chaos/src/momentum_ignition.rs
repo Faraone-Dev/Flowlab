@@ -1,50 +1,16 @@
-//! Momentum-ignition detector.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! Momentum-ignition detector. Monotone mid drift ≥ `min_move_bps`
+//! over ≥ `min_consecutive` samples in a dual window (seq+time), with
+//! ≥ `min_trades` trades and signed aggressor imbalance in the same
+//! direction. Refractory `cooldown_seq` after each flag.
 //!
-//! ## Definition
-//!
-//! Momentum ignition is a sequence of *aggressive* takes — typically
-//! sweeping multiple price levels in one direction — designed to
-//! provoke other participants (momentum followers, stop hunters,
-//! latency-sensitive HFT) into chasing the move. The textbook
-//! signature, observable on a single feed, is:
-//!
-//!   1. a **monotone midprice drift** of at least `min_move_bps`,
-//!   2. accumulated within a **dual rolling window** (seq + time),
-//!   3. supported by a **trade-imbalance** in the same direction
-//!      (aggressors disproportionately on one side),
-//!   4. lasting at least `min_consecutive` mid samples
-//!      (filters tick-level micro-noise),
-//!   5. above a minimum trade count `min_trades`
-//!      (ignores quiet drifts),
-//!   6. and not inside a refractory period (`cooldown_seq`).
-//!
-//! Stay coupling-free with `flowlab-core`: the detector keeps its own
-//! minimal top-of-book (BTreeMap<price, qty> per side) updated by ADD
-//! / CANCEL / TRADE. We only need best_bid/best_ask to derive midprice
-//! and spread; depth beyond a handful of nearby levels is irrelevant
-//! for the signal.
-//!
-//! ## Mini-book invariants
-//!
-//!   * Empty levels (qty == 0) are pruned on every event.
-//!   * Total tracked levels are capped at `max_book_levels` per side;
-//!     when exceeded, we evict the level **farthest from the best** on
-//!     that side. This is deterministic and O(log n) without an LRU
-//!     accounting structure.
-//!   * `best_bid()` / `best_ask()` are simply `BTreeMap::last_key()`
-//!     and `first_key()`.
-//!
-//! ## Trade aggression heuristic
-//!
-//! ITCH does not flag aggressor side directly. We classify a trade
-//! relative to the most recent mid:
-//!
-//!   * `trade.price >= mid_at_trade_time` -> buy-aggressor pressure
-//!   * `trade.price <  mid_at_trade_time` -> sell-aggressor pressure
-//!
-//! This is the standard tick-rule classifier. It is wrong on ~5-10 %
-//! of mid-quote prints, which is fine because the detector requires a
-//! *signed imbalance*, not single-trade attribution.
+//! Self-contained mini-book (BTreeMap per side); empty levels pruned,
+//! `max_book_levels` cap evicts farthest-from-best. Aggressor side
+//! from tick rule against last mid (~5-10% wrong on mid-quote prints,
+//! tolerated because we require signed *imbalance*, not per-trade
+//! attribution).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -354,10 +320,18 @@ impl MomentumIgnitionDetector {
         }
     }
 
-    /// Evict mid samples and decay pressure counters when entries fall
-    /// outside the rolling window.
+    /// Evict mid samples that fall outside the rolling window.
+    ///
+    /// Pressure / trade counters are NOT decayed per-eviction — doing
+    /// so soundly would require a per-event ring of trade aggressors,
+    /// which we deliberately skip (the detector only needs *signed
+    /// imbalance*, not exact magnitudes). The counters are reset in
+    /// bulk only when the mid deque empties (window fully cleared) or
+    /// when a flag fires (in `process()`). On long flat windows this
+    /// means pressure can accumulate beyond the strict mid-window
+    /// span; we accept this because the persistence + min_trades +
+    /// imbalance gates already filter quiet drifts.
     fn evict_expired(&mut self, cur_seq: u64, cur_ts: u64) {
-        // Mids: cheap eviction, just drop heads outside both windows.
         while let Some(front) = self.mids.front() {
             let too_old_seq = self.seq_window > 0
                 && cur_seq.saturating_sub(front.seq) > self.seq_window;
@@ -369,14 +343,6 @@ impl MomentumIgnitionDetector {
                 break;
             }
         }
-        // Pressure / trade counters: simplest sound model is to decay
-        // them when the front of the mids deque has just been popped
-        // — the window has effectively rotated. We approximate by
-        // bleeding ~5 % of pressure per evicted sample, and capping at
-        // 0. This avoids maintaining a full per-event ring buffer for
-        // a quantity we only need for ordering.
-        // For determinism in tests we keep this simple: when no mid
-        // samples remain, fully reset pressure.
         if self.mids.is_empty() {
             self.buy_pressure = 0;
             self.sell_pressure = 0;

@@ -1,11 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! SyntheticSource — deterministic event generator for bringup and tests.
 //!
-//! NOT a market simulator. Produces a coherent ADD/CANCEL/TRADE mix that:
-//!   - keeps a HotOrderBook populated (so analytics produce non-trivial values)
-//!   - exercises every code path in flow + risk
-//!   - is bit-reproducible from a seed
-//!
-//! Real sources (IchSource, BinanceSource) are added in follow-up steps.
+//! NOT a market simulator. Coherent ADD/CANCEL/TRADE mix that keeps a
+//! HotOrderBook populated, exercises every flow+risk path, and is
+//! bit-reproducible from a seed.
 
 use crate::source::Source;
 use flowlab_core::event::{Event, EventType, Side};
@@ -20,31 +20,20 @@ pub struct SyntheticSource {
     /// Pool of resting order_ids we can cancel/trade against.
     live_orders: Vec<(u64, u64, u8)>, // (oid, price_ticks, side)
     mid_ticks: i64,
-    /// Episode regime — drives the dashboard through CALM → VOLATILE
-    /// → AGGRESSIVE → CRISIS so the regime classifier and the chaos
-    /// pattern strip actually move on the synthetic feed.
+    /// Episode regime — drives dashboard through CALM → VOLATILE →
+    /// AGGRESSIVE → CRISIS so regime classifier and chaos strip move.
     phase: Phase,
     /// Events left in the current phase before transitioning.
     phase_remaining: u32,
 }
 
-/// Synthetic episode phase.
-///
-/// Each phase emits the same `OrderAdd / Cancel / Trade` primitives but
-/// with a deliberately skewed mix that drives the downstream metrics
-/// the regime classifier feeds on:
-///
-///   * `Calm`           — symmetric flow, baseline VPIN / velocity.
-///   * `ImbalanceBurst` — one-sided ADDs with no opposing flow → book
-///                        imbalance climbs toward ±1.0, regime ≥ Volatile.
-///   * `TradeBurst`     — flips to ~80 % Trades on a chosen side, drives
-///                        `trade_velocity_ratio` and VPIN well above 1
-///                        → regime Aggressive.
-///   * `Flash`          — short, violent: cancel storm followed by
-///                        one-sided trades, exercises the
-///                        `flash_crash` + `momentum_ignition` chaos
-///                        branches in `lab` and pushes the score past
-///                        the Crisis threshold (6.0).
+/// Synthetic episode phase. Each emits ADD/CANCEL/TRADE primitives with
+/// a skewed mix to drive downstream metrics:
+///   * `Calm`           — symmetric flow, baseline VPIN/velocity.
+///   * `ImbalanceBurst` — one-sided ADDs, imbalance → ±1.0.
+///   * `TradeBurst`     — ~80% Trades on chosen side, drives velocity+VPIN.
+///   * `Flash`          — cancel storm + one-sided trades, fires
+///                        flash_crash + momentum_ignition past Crisis (6.0).
 #[derive(Copy, Clone)]
 enum Phase {
     Calm,

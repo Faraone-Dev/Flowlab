@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Fuzz #1 — Order book consistency under random event flow.
 //!
 //! WHAT IT PROVES

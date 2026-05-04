@@ -1,45 +1,12 @@
-//! Latency-arbitrage *reaction proxy*.
-//!
-//! ## Honest naming
-//!
-//! On a single ITCH feed you cannot prove cross-venue arbitrage; you
-//! lack the second feed needed to show one venue *moved before* the
-//! other. What you can measure is a *behavioural proxy*: a market
-//! taker prints at T₀, and within a tiny window, a burst of `OrderAdd`
-//! / `OrderCancel` events lands on the **opposite side** in the same
-//! micro price-band. That is the observable shadow of someone reacting
-//! to (or anticipating) the print — possibly because they saw the same
-//! information on a faster venue, possibly for unrelated reasons.
-//! The detector flags the *pattern*; the analyst decides on cause.
-//!
-//! ## Trigger
-//!
-//!   1. A `Trade` event of qty ≥ `min_trade_qty` lands at price `p₀`
-//!      and direction `dir` (deduced from tick rule against the mid
-//!      *before* the trade).
-//!   2. Within a dual rolling window
-//!      (`reaction_seq` events OR `reaction_time_ns` ns, whichever
-//!      fires first) we observe ≥ `min_burst` `OrderAdd`/`OrderCancel`
-//!      events on the **opposite side** with `|p - p₀| ≤ band_ticks`.
-//!   3. Optional reversion gate: if `require_reversion` is set, the
-//!      mid must snap back by ≥ `reversion_bps` toward `p₀` within
-//!      `reaction_seq` of the burst end, so we don't catch
-//!      trend-following follow-through.
-//!
-//! ## Why "opposite side"
-//!
-//! A genuine reaction-to-print pattern moves the *quoted* opposite
-//! side (someone repricing their resting orders to defend against the
-//! tape). Bursts on the same side as the trade are normally "queue
-//! recovery" and look qualitatively similar to phantom-liquidity, so
-//! we keep them out of this detector to avoid double-flagging.
-//!
-//! ## Self-contained
-//!
-//! Like the other detectors in this crate, no dependency on a hot
-//! orderbook. We track only the rolling mid (top-of-book) and a tiny
-//! deque of pending trade-triggers waiting for their reaction window
-//! to close.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! Latency-arb reaction proxy. Single-feed behavioural pattern: a
+//! taker print of qty ≥ `min_trade_qty` followed within a dual window
+//! (seq+time) by ≥ `min_burst` ADD/CANCEL events on the **opposite**
+//! side inside `±band_ticks`. Optional reversion gate filters
+//! trend-following follow-through. Cannot prove cross-venue arb; flags
+//! the pattern only. Self-contained mini-book.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -208,7 +175,13 @@ impl LatencyArbProxyDetector {
                         burst_qualified: false,
                     });
                     if self.pending.len() > 64 {
-                        self.pending.pop_front();
+                        let dropped = self.pending.pop_front();
+                        tracing::warn!(
+                            target: "flowlab_chaos::lat_arb_proxy",
+                            dropped_seq = dropped.as_ref().map(|t| t.seq).unwrap_or(0),
+                            cur_seq = seq_event.seq,
+                            "pending trigger overflow (>64), dropping oldest",
+                        );
                     }
                 }
             }

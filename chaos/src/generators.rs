@@ -1,52 +1,24 @@
-//! Adversarial event generators — the duals of the five chaos
-//! detectors. Each generator emits a deterministic `SequencedEvent`
-//! stream that, fed into its corresponding `*Detector`, fires a
-//! `ChaosEvent` of the matching `ChaosKind` with `severity > 0`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! Adversarial event generators — duals of the five detectors.
+//! Each emits a deterministic `SequencedEvent` stream that, fed into
+//! its matching `*Detector`, fires the corresponding `ChaosKind`.
+//! Closed-loop test rig: same software is judge and prosecutor.
 //!
-//! ## Why "dual"
+//! Determinism: `xorshift64*` seeded from `seed: u64`. No clock, no
+//! `thread_rng`, no `HashMap` order. Same `(seed, params)` →
+//! bit-identical bytes.
 //!
-//! A detector is a recogniser: stream → flag. A generator is the
-//! inverse: parameters → stream that the detector recognises. Pairing
-//! them gives a closed-loop test rig: the same software is judge
-//! (detector) and prosecutor (generator), so the bench is provably
-//! self-consistent — no human disagreement on "is this really a
-//! flash crash?".
-//!
-//! ## Determinism
-//!
-//! Every generator takes a `seed: u64` and a 64-bit `xorshift64*`
-//! PRNG so the byte stream is bit-identical for identical
-//! `(seed, parameters)`. No system clock, no `thread_rng`, no
-//! `HashMap` iteration order. Two runs with the same seed produce
-//! the same flag pattern.
-//!
-//! ## Common contract
-//!
-//! ```text
-//! trait StormGenerator {
-//!     fn step(&mut self, now_ns: u64, base_seq: u64) -> Vec<SequencedEvent>;
-//!     fn next_due_ns(&self) -> u64;
-//!     fn finished(&self) -> bool;
-//! }
-//! ```
-//!
-//! The orchestrator polls `next_due_ns()` to pace the storm and stops
-//! it once `finished()` returns true.
-//!
-//! ## Severity
-//!
-//! Every generator takes `severity: f32 ∈ [0.0, 1.0]`. The semantics
-//! are pattern-specific (more cycles, larger jump, faster cancel
-//! ratio) but the contract is monotone: higher severity → stronger
-//! signal at the detector → higher `ChaosEvent.severity`.
+//! Contract (`StormGenerator`):
+//! `step(now_ns, base_seq) → Vec<SequencedEvent>`, `next_due_ns()`,
+//! `finished()`. `severity ∈ [0, 1]` is pattern-specific but monotone
+//! in detector signal.
 
 use flowlab_core::event::{Event, EventType, SequencedEvent, Side};
 
-// ─── PRNG ────────────────────────────────────────────────────────────
-//
-// xorshift64* — deterministic, 64-bit state, ~7 ns per next(). We
-// avoid `rand::rngs::StdRng` to keep this crate dependency-light and
-// because `StdRng` does not guarantee bit-identity across releases.
+// xorshift64* — deterministic, ~7 ns per next(). Avoid `StdRng` for
+// dep weight + cross-release bit-identity.
 
 #[derive(Debug, Clone)]
 pub struct DetRng {

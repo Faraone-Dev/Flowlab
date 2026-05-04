@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Source — pluggable event producer.
 //!
 //! Sync MVP. The trait deliberately has zero async dependencies so it can be

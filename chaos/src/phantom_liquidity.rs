@@ -1,43 +1,14 @@
-//! Phantom-liquidity detector.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! Phantom-liquidity detector. A level created by `OrderAdd`, never
+//! traded, then fully cancelled within `max_seq_gap` events or
+//! `max_time_gap_ns` ns (dual window). Flags the pattern only — ITCH
+//! cannot prove intent.
 //!
-//! ## Definition
-//!
-//! A *phantom* level is a price level that:
-//!
-//!   1. is **created** by an `OrderAdd` (the first add at that price/side
-//!      after the level was empty),
-//!   2. accumulates one or more orders **without ever being traded
-//!      against**,
-//!   3. is **fully removed** by `OrderCancel` events within either
-//!      `max_seq_gap` events or `max_time_gap_ns` ns of its creation,
-//!      whichever fires first (dual window).
-//!
-//! Real liquidity providers leave their orders at risk of execution.
-//! A pattern of book-padding adds that vanish before any taker can hit
-//! them is the textbook signature of "spoof-as-a-service" liquidity
-//! that exists only to mislead the consolidated tape. ITCH-only feeds
-//! cannot prove intent; this detector flags the *pattern*, the human
-//! decides on attribution.
-//!
-//! ## Self-contained tracker
-//!
-//! The detector keeps its own micro-orderbook indexed by `(side, price)`,
-//! with one entry per *currently-tracked* phantom-candidate level. It
-//! does NOT depend on `flowlab-core::HotOrderBook`: the tracker only
-//! needs to know "did this level ever see a trade?". This isolation
-//! keeps the unit tests trivial and decouples chaos detection from the
-//! hot path.
-//!
-//! ## Memory characteristics
-//!
-//! Tracker uses two `HashMap`s:
-//!   * `levels: HashMap<(u8, u64), LevelTracker>` — one entry per live
-//!     candidate level.
-//!   * `orders: HashMap<u64, (u8, u64)>` — order_id -> (side, price)
-//!     resolution map for cancel events that don't carry a price.
-//!
-//! Both are bounded by `max_tracked` (LRU-pruned by `created_seq` when
-//! exceeded) so a long replay cannot grow the tracker without bound.
+//! Self-contained tracker: `levels: HashMap<(side, price), ...>` plus
+//! `orders: HashMap<order_id, (side, price)>` for cancels that omit
+//! price. Both bounded by `max_tracked`, LRU-pruned by `created_seq`.
 
 use std::collections::HashMap;
 
@@ -214,12 +185,21 @@ impl PhantomLiquidityDetector {
         let tracker = self.levels.get_mut(&key)?;
 
         // Cancel qty == 0 is ITCH 'D' (full delete of the resting order).
-        // For tracking purposes we treat that as "the entire incremental
-        // qty of the most recent add of this order is removed". Without
-        // per-order qty memory we approximate by deducting the average
-        // contribution; that is fine for the threshold check below
-        // because we ALSO require cancel_count >= order_count, which
-        // never trips on a partial cancel.
+        // We do not keep per-order qty memory inside the level tracker
+        // (only the aggregated `added_qty`), so we approximate the
+        // removed quantity as the per-order *average* contribution at
+        // this level: `(added - cancelled) / order_count`.
+        //
+        // Consequences:
+        //   * No false positives: the gate also requires
+        //     `cancel_count >= order_count`, which only trips when
+        //     every add at the level has been cancelled.
+        //   * Possible false negatives: if a single huge order is
+        //     cancelled inside a level that also held many small ones,
+        //     `removed_qty` is averaged down and `fully_cancelled()`
+        //     may not flip until further cancels arrive. Acceptable
+        //     for ITCH-only flows where per-order qty replay is not
+        //     available; flag-rate impact is small in practice.
         let removed_qty = if event.qty == 0 {
             tracker
                 .added_qty

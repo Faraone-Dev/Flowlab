@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! flowlab-engine binary.
 //!
 //! Pulls events from a Source, runs them through the analytics pipeline,

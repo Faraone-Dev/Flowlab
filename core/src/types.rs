@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 /// Price in raw ticks (integer representation, no floating point)
 pub type Price = u64;
 /// Quantity in fixed-point units

@@ -1,28 +1,24 @@
-//! Single-producer / single-consumer ring buffer IPC reader.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! SPSC ring buffer IPC reader.
 //!
-//! Mirrors the layout produced by the Go ingest service
-//! (`ingest/mmap/ring.go`) so Zig/Rust consumers can zero-copy
-//! data written by the Go feed handler.
-//!
-//! Layout (all little-endian, cache-line aware):
+//! Mirrors the Go ingest writer (`ingest/mmap/ring.go`) for zero-copy
+//! Zig/Rust consumption. All little-endian.
 //!
 //! ```text
 //!   [0..8)     magic "FLOWRING"
-//!   [8..16)    capacity (u64, payload bytes)
-//!   [16..64)   reserved (zero)
-//!   [64..72)   writeIdx  (u64, atomic, own cache line)
-//!   [128..136) readIdx   (u64, atomic, own cache line)
-//!   [192..192+capacity)  payload (power-of-two size)
+//!   [8..16)    capacity (u64, payload bytes; power-of-two)
+//!   [16..64)   reserved
+//!   [64..72)   writeIdx (u64 atomic, own cache line)
+//!   [128..136) readIdx  (u64 atomic, own cache line)
+//!   [192..192+capacity) payload
 //! ```
 //!
-//! `writeIdx` / `readIdx` are monotonically increasing counters
-//! (NOT wrapped). Slot offset is `payload[(idx mod capacity)]`,
-//! so `capacity` MUST be a power of two for a branch-free mask.
-//!
-//! Memory ordering matches the Go writer:
-//! - writer: `memcpy(payload); Release-store(writeIdx = wi + n)`
-//! - reader: `Acquire-load(writeIdx)` pairs with the above;
-//!           `Release-store(readIdx = ri + n)` after consumption.
+//! Indices are monotonically increasing (NOT wrapped); slot offset =
+//! `payload[idx & mask]`. Ordering: writer Release-stores writeIdx after
+//! payload memcpy; reader Acquire-loads writeIdx, Release-stores readIdx
+//! after consume.
 
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::OpenOptions;

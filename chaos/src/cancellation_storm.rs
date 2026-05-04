@@ -1,49 +1,20 @@
-//! Cancellation-storm detector.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+
+//! Cancellation-storm detector. Fires when normalized cancel-rate
+//! (cancels / total events in the window) sits above adaptive
+//! `μ + k·σ̂` for ≥ `min_consecutive` samples.
 //!
-//! ## Definition
+//! Guards:
+//!   * Dual window (seq + time) — evicts ghost cancels on quiet feeds.
+//!   * Warmup + σ floor — no flag before `warmup_samples`, prevents
+//!     single-sample variance collapse.
+//!   * Persistence + `cooldown_seq` refractory.
 //!
-//! A *cancellation storm* is a period during which the **normalized
-//! cancel rate** (cancels / total events in the recent window) sits
-//! consistently above the running adaptive baseline `μ + k·σ̂` for at
-//! least `min_consecutive` consecutive samples.
-//!
-//! Real venues quote-cancel routinely; what marks a storm is the
-//! *deviation* from the local norm, not the absolute count. ITCH 5.0
-//! routinely shows >85 % cancel ratios for healthy market makers; a
-//! purely count-based threshold would either fire constantly (low cap)
-//! or never (high cap). The adaptive baseline solves both.
-//!
-//! ## Robustness contract
-//!
-//! Three guards prevent the classical false-positive failure modes:
-//!
-//!   1. **Dual rolling window** (sequence + time) — events outside
-//!      EITHER bound are evicted. Eliminates "ghost cancels" that look
-//!      adjacent in seq but are seconds apart on a quiet feed.
-//!   2. **Warmup + σ floor** — the adaptive threshold is suppressed
-//!      until `warmup_samples` independent rate observations are
-//!      accumulated AND `σ̂` is floored at `sigma_floor` to prevent
-//!      single-sample collapse to zero variance (which would flag
-//!      every subsequent micro-tick).
-//!   3. **Persistence + refractory** — the storm flag fires only after
-//!      the rate stays above threshold for `min_consecutive` samples,
-//!      and after a flag the detector enters a `cooldown_seq` window
-//!      during which further flags are suppressed (refractory period).
-//!
-//! ## Why Welford and not EMA
-//!
-//! Welford's incremental algorithm gives an unbiased running mean and
-//! variance with O(1) state and no decay parameter to tune. It does
-//! drift slowly when the underlying distribution changes (vs an EMA
-//! which adapts to recent regime), so we *pause* the Welford update
-//! while a storm is in progress: this prevents the baseline from being
-//! poisoned by the very anomaly we are trying to detect.
-//!
-//! ## State characteristics
-//!
-//! Per-detector state is `O(window_size)` for the deque + 24 B for the
-//! Welford accumulators + 32 B of bookkeeping. Self-contained: no
-//! reference to `flowlab-core::HotOrderBook` or any external state.
+//! Welford is **cumulative** (no per-sample downdate). Updates are
+//! paused during bursts + refractory so the baseline isn't poisoned
+//! by the anomaly. Self-contained, no `flowlab-core` book reference.
 
 use std::collections::VecDeque;
 
@@ -52,8 +23,9 @@ use flowlab_core::types::SeqNum;
 
 use crate::{ChaosEvent, ChaosFeatures, ChaosKind};
 
-/// Welford running mean / variance accumulator. Numerically stable
-/// across the full range of f64 we'll ever feed it (rates in `[0, 1]`).
+/// Cumulative Welford accumulator. No downdate — `update()` is paused
+/// during bursts/refractory (see `process()`) to keep baseline
+/// anchored to non-storm samples.
 #[derive(Debug, Clone, Default)]
 struct Welford {
     n: u64,

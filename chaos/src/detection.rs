@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 use std::collections::VecDeque;
 use flowlab_core::event::{EventType, SequencedEvent};
 use flowlab_core::types::SeqNum;

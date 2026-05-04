@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! E2E #4 — Rust ↔ C++ `StateHasher` bit-exact agreement.
 //!
 //! WHAT IT PROVES

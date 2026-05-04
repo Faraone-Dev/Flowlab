@@ -1,24 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Offline ITCH replay source.
 //!
-//! Reads a raw NASDAQ ITCH 5.0 bytestream (no length prefix — the
-//! message boundary is implicit in the per-type length table) from a
-//! file and streams it into a [`RingWriter`] exactly like a live feed
-//! handler would. This is the first path that lets the pipeline
-//! ingest *real* market data (e.g. NASDAQ historical BinaryFILE dumps)
-//! end-to-end, not just synthetic streams.
+//! Reads raw NASDAQ ITCH 5.0 (no length prefix — boundaries from per-type
+//! length table) from a file and streams into a [`RingWriter`] like a
+//! live handler.
 //!
-//! Design points:
-//! - **Zero copy on the read side**: the consumer decides when to
-//!   parse; we never decode ITCH here.
-//! - **Back-pressure friendly**: when the ring is full we yield and
-//!   retry, instead of dropping. Drop policy is a separate concern.
-//! - **Pacing**: optional wall-clock pacing via `Pace::RealTime` uses
-//!   the ITCH message timestamp to preserve inter-arrival spacing;
-//!   `Pace::AsFastAsPossible` is the default and saturates the ring.
-//! - **Bounded look-ahead**: we never publish a partial ITCH message
-//!   — the writer advances the ring cursor on whole-message
-//!   boundaries so the consumer can assume `parse_buffer` never fails
-//!   mid-record.
+//! - Zero-copy on read: consumer decides when to parse.
+//! - Back-pressure friendly: yield + retry on full ring (drop policy elsewhere).
+//! - Pacing: optional `RealTime { speedup }` from ITCH ts48; default saturates.
+//! - Bounded look-ahead: only whole messages are published.
 
 use crate::itch::msg_length;
 use crate::ring_reader::{RingError, RingWriter};

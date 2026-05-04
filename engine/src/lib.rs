@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! flowlab-engine — runtime that drives a Source through the analytics
 //! pipeline and publishes telemetry over TCP.
 //!

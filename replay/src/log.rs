@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Smoke-test the IchSource against a real BinaryFILE-framed dump.
 //!
 //! Skipped automatically when `FLOWLAB_ITCH_FILE` is not set so CI on

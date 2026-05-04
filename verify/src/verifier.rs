@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 /// Cross-language state verification.
 /// Compares hashes produced by Rust core vs C++ hotpath.
 pub struct CrossLanguageVerifier {

@@ -1,30 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! MoldUDP64 framing + sequence-gap recovery.
 //!
-//! MoldUDP64 is the transport NASDAQ uses to multicast ITCH over UDP.
-//! Each datagram begins with a 20-byte header:
+//! NASDAQ multicast transport for ITCH. 20-byte header:
 //!
 //! ```text
-//!   [0..10)   session   — 10-byte ASCII session identifier
-//!   [10..18)  sequence  — u64 BE, sequence of the FIRST message in this frame
-//!   [18..20)  count     — u16 BE, number of messages that follow
+//!   [0..10)  session   — 10-byte ASCII
+//!   [10..18) sequence  — u64 BE, seq of FIRST message in frame
+//!   [18..20) count     — u16 BE, message count
 //! ```
 //!
-//! The body is `count` back-to-back messages, each prefixed by a
-//! u16 BE length:
+//! Body: `count` back-to-back `[u16 BE len][msg]`. Specials:
+//! `count == 0xFFFF` → End-of-Session, `count == 0x0000` → Heartbeat.
 //!
-//! ```text
-//!   [ len_0 BE | msg_0 ] [ len_1 BE | msg_1 ] ...
-//! ```
-//!
-//! Special values:
-//! - `count == 0xFFFF`: End-of-Session marker (no body).
-//! - `count == 0x0000`: Heartbeat (keep-alive, no body).
-//!
-//! This module does two things:
-//! 1. Parse frames without allocations using [`MoldFrame::parse`].
-//! 2. Detect and reconcile out-of-order / missing packets via
-//!    [`GapTracker`], which buffers forward frames until the gap is
-//!    filled (either by re-order or by a retransmit).
+//! [`MoldFrame::parse`] is alloc-free; [`GapTracker`] buffers forward
+//! frames until reorder/retransmit fills the gap.
 
 use std::collections::BTreeMap;
 

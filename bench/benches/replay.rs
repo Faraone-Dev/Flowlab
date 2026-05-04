@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use flowlab_bench::{realistic_events, warmup_events, MarketConfig};
 use flowlab_core::hot_book::HotOrderBook;

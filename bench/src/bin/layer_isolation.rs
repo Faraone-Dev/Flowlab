@@ -1,36 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Layer-isolation diagnostic.
 //!
-//! Goal: when sustained-throughput benchmarks drift over multiple runs,
-//! separate the three suspect layers:
+//! Run a fixed workload N times **inside one process** with inputs
+//! pre-allocated before the timing loop, to separate drift sources:
 //!
-//!   (A) CPU frequency scaling / turbo throttling
-//!   (B) Memory / cache / TLB working-set effects
-//!   (C) Allocator / page-cache contamination across processes
+//!   (A) wall drifts but rdtsc cycles flat → CPU freq throttle.
+//!   (B) both wall and cycles drift up         → working-set / cache / BTB.
+//!   (C) iter-1 slow then flat                 → cold cache + first-touch.
+//!   (D) flat in-process, drift across procs   → allocator/page-cache state.
 //!
-//! Strategy: run the same fixed workload N times **inside one process**,
-//! with all input buffers pre-allocated **before** the timing loop. Then:
-//!
-//!   * If per-iter wall time DRIFTS but rdtsc-cycles per iter stays flat
-//!     → CPU frequency dropped (turbo throttle / power scheme).
-//!     This is layer (A).
-//!
-//!   * If both wall time AND cycles per iter drift up monotonically
-//!     → working-set / cache pressure or branch-predictor pollution.
-//!     This is layer (B).
-//!
-//!   * If iter-1 is much slower than iter-2..N then flat afterwards
-//!     → cold-cache + first-touch faulting; not a sustained problem.
-//!
-//!   * If everything is flat in-process, but multi-process Criterion
-//!     runs drift → layer (C) (allocator state across processes,
-//!     page cache on shared inputs, etc).
-//!
-//! No allocations happen inside the timing loop. `Vec` capacity is
-//! reserved once. `HotOrderBook` is reset by `clear()` between iters,
-//! not re-allocated.
-//!
-//! Output is one CSV line per iter so the user can paste it into a
-//! spreadsheet and see drift trends without our interpretation.
+//! No allocs in timing loop; `HotOrderBook::clear()` between iters.
+//! One CSV line per iter — user reads the trend.
 
 use std::time::Instant;
 

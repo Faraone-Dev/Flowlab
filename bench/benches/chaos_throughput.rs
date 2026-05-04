@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Chaos detector chain throughput bench.
 //!
 //! Goal: measure the cost-per-event of running the full 5-detector

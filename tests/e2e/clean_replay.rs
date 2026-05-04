@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! E2E #1 — Clean replay end-to-end (cross-language oracle).
 //!
 //! WHAT IT PROVES

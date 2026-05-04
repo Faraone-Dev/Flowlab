@@ -1,21 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! UDP multicast ingress for MoldUDP64 feeds.
 //!
-//! Opens a socket, optionally joins a multicast group, and drives a
-//! [`crate::moldudp::GapTracker`] for in-order delivery. Delivered
-//! messages are fed sequentially to a user-supplied closure so the
-//! caller can forward them to a [`crate::RingWriter`], a [`crate::Wal`],
-//! a strategy, or all three.
+//! Opens a socket, optionally joins a multicast group, drives a
+//! [`crate::moldudp::GapTracker`] for in-order delivery, feeds delivered
+//! messages to a user closure (forward to ring/WAL/strategy).
 //!
-//! Socket tuning:
-//! - SO_RCVBUF is raised to 8 MiB by default to absorb bursts without
-//!   kernel drops. Under NASDAQ TotalView at market open this is the
-//!   single biggest source of packet loss.
-//! - The socket is placed in non-blocking mode so the handler loop
-//!   can service other work (e.g. retransmit requests) between reads.
-//!
-//! Thread model:
-//! - One handler = one thread. If you need wider parallelism, shard
-//!   by multicast group across multiple [`UdpFeedHandler`] instances.
+//! Tuning: SO_RCVBUF default 8 MiB (NASDAQ TotalView open burst absorber);
+//! socket non-blocking so the loop can service retransmit requests.
+//! Threading: one handler = one thread. Shard by group for parallelism.
 
 use crate::moldudp::{Delivered, GapTracker, MoldFrame};
 use std::io;

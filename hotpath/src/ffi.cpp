@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 #include "flowlab/ffi.h"
 #include "flowlab/orderbook.h"
 #include "flowlab/hasher.h"

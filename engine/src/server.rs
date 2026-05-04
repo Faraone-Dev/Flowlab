@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! TCP telemetry server.
 //!
 //! Single-client at a time (Go API is the only consumer). On accept, we drain

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Integration test: byte-exact interop with the Go ring-buffer writer.
 //!
 //! The Go `ingest/mmap/ring.go` writer produces this exact on-disk

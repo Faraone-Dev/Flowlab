@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 /// Canonical event format — must match Rust `#[repr(C)] Event` exactly.
 /// 40 bytes, 8-byte aligned, little-endian, zero-padding.
 ///

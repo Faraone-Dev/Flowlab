@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Shared helpers for end-to-end and fuzz harnesses.
 //!
 //! Kept intentionally tiny: the signal layer must read like the

@@ -1,15 +1,14 @@
-//! Foreign Function Interface — bindings to C++ hotpath and Zig feed-parser.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
+//! FFI — C++ hotpath + Zig feed-parser bindings.
 //!
-//! These declarations match the C ABI exports from:
-//!   - `hotpath/include/flowlab/ffi.h`   (C++ SIMD order book + hasher)
-//!   - `feed-parser/src/main.zig`        (comptime ITCH parser)
-//!
-//! Linking is handled by build.rs which finds the static libraries
-//! produced by CMake (hotpath) and Zig (feed-parser).
+//! Matches C ABI from `hotpath/include/flowlab/ffi.h` and
+//! `feed-parser/src/main.zig`. build.rs links the static libs.
 
 use crate::event::Event;
 
-// ─── C++ Hotpath ──────────────────────────────────────────────────────
+// C++ Hotpath
 
 unsafe extern "C" {
     /// Create a new C++ order book. Returns opaque handle.
@@ -46,7 +45,7 @@ unsafe extern "C" {
     pub fn flowlab_hasher_digest(hasher: *const core::ffi::c_void) -> u64;
 }
 
-// ─── Zig Feed Parser ─────────────────────────────────────────────────
+// Zig Feed Parser
 
 unsafe extern "C" {
     /// Parse a raw ITCH 5.0 buffer into canonical events.

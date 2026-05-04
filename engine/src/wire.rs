@@ -1,30 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Telemetry wire protocol.
 //!
-//! ── Frame ──────────────────────────────────────────────────────────────
+//! Frame: `[u32 LE len][u16 LE version][payload]`. `len` excludes itself.
+//! `payload` = bincode `TelemetryFrame` (or JSON if `--wire=json`).
 //!
-//! ```text
-//! +-------+---------+-----------+
-//! | u32 LE | u16 LE  | payload  |
-//! |  len   | version |   (bin)  |
-//! +-------+---------+-----------+
-//! ```
+//! Bump `WIRE_VERSION` on any breaking `TelemetryFrame` change
+//! (rename, removed variant, retagged enum). Additive changes may
+//! ship without bump but bumping is free — prefer it.
 //!
-//! `len`     = bytes of `version + payload` (NOT including the u32 itself)
-//! `version` = wire protocol version. Current release = v2.
-//! `payload` = bincode-encoded `TelemetryFrame`, or JSON if `--wire=json`.
-//!
-//! Versioning rule: any breaking change to `TelemetryFrame` (field rename,
-//! removed variant, changed enum tag) MUST bump `WIRE_VERSION`. Additive
-//! changes (new variant at the end of the enum, new optional field) MAY
-//! ship without a bump but are discouraged — bump anyway, it's free.
-//!
-//! ── Honesty boundary ───────────────────────────────────────────────────
-//! `event_time_ns` and `process_time_ns` are deliberately TWO fields, not
-//! one. They MUST never be aliased downstream:
-//!   - event_time_ns   : source-provided wall clock (ITCH ts48, Binance E)
+//! `event_time_ns` and `process_time_ns` are deliberately separate:
+//!   - event_time_ns   : source clock (ITCH ts48, Binance E)
 //!   - process_time_ns : engine CLOCK_MONOTONIC at apply
-//! Latency = process - event ONLY where the two clocks are comparable
-//! (i.e. NOT for crypto WAN feeds without NTP discipline).
+//! Latency = process - event ONLY where both clocks are comparable
+//! (NOT for crypto WAN feeds without NTP discipline).
 
 use serde::{Deserialize, Serialize};
 

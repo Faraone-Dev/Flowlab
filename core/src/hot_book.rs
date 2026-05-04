@@ -1,52 +1,39 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Hot-path order book — fixed-depth sorted arrays + slab-backed order index.
 //!
 //! Mirrors the C++ `OrderBook<MaxLevels>` template exactly.
 //!
-//! Three optimization levels:
-//!   L1: Sorted arrays, no heap (for the price grid), no trees — cache-contiguous
-//!   L2: 64-byte aligned struct for cache-line isolation, prefetch on depth scan
-//!   L3: SIMD depth sum (portable_simd), branch-free insertion via binary search + memmove
+//! Optimizations:
+//!   L1: sorted arrays, no heap, no trees — cache-contiguous price grid
+//!   L2: 64-byte aligned struct (no false sharing), prefetch on depth scan
+//!   L3: SIMD depth sum (portable_simd), branch-free insertion
 //!
-//! ## Order index design (variance-stable, slab-backed)
+//! Order index split for cache footprint:
+//!   * `slab: Vec<OrderMeta>` — dense payload storage, reused via free_list.
+//!   * `index: HashMap<u64, u32>` — order_id → slab slot. 12 B/entry instead
+//!     of 32 B → ~5× more entries per cache line on lookup.
 //!
-//! ITCH 5.0 cancel/trade messages carry only `order_id`, so we MUST keep
-//! a mapping `order_id → (price, qty, side)` somewhere. To minimise the
-//! cache footprint of that mapping we split it in two:
+//! aHash with **fixed seed** for deterministic iteration across runs (not
+//! used in canonical L2 hash, but enables bit-exact replays).
 //!
-//!   * `slab: Vec<OrderMeta>` — dense, contiguous storage of the order
-//!     payloads. Reused via `free_list` so it does not grow unbounded.
-//!   * `index: HashMap<u64, u32>` — maps external `order_id` to a slab
-//!     slot. Entries are 12 B (8+4) instead of 32 B (8+24), so the same
-//!     cache line carries ~5× more entries → fewer misses on lookup.
+//! Hot-path α (frozen 2026-04-20, 3.79 GHz x86_64, 60/25/15 mix, 256 depth,
+//! 500k events). See [`../../docs/latency-alpha.md`].
 //!
-//! The hash uses **aHash with a fixed seed** for deterministic iteration
-//! order across runs (the canonical L2 hash never iterates the index, but
-//! we want bit-exact replays anyway).
-//!
-//! ## Hot-path performance characteristics (α frozen 2026-04-20)
-//!
-//! Measured by `bench/src/bin/latency_apply.rs` on a 3.79 GHz x86_64 box,
-//! 60/25/15 ADD/CANCEL/TRADE realistic mix, 256-deep book, ahash-backed
-//! slab. See [`../../docs/latency-alpha.md`] for the full report and
-//! reproduction recipe.
-//!
-//! | Metric (STEADY mix, 500 000 events) | Baseline | α      |
+//! | Metric                              | Baseline | α      |
 //! |-------------------------------------|----------|--------|
 //! | TRADE p50                           |  72 ns   |  30 ns |
 //! | TRADE p99                           | 352 ns   | 128 ns |
 //! | TOTAL p99                           | 160 ns   |  88 ns |
 //! | Wall apply-only (500k events)       | 22.5 ms  | 17.1 ms|
 //!
-//! Two changes carried the gain:
-//! 1. `trade()` hot/cold split — partial-fill is straight-line, full-fill
-//!    and anonymous-trade are out-of-line `#[cold]` helpers.
-//! 2. [`HotOrderBook::prefetch_event`] — `_mm_prefetch T0` on the slab
-//!    slot AND on the bids/asks top cache lines, called by the producer
-//!    one event ahead of the matching [`HotOrderBook::apply`].
+//! Wins: (1) `trade()` hot/cold split — partial-fill straight-line,
+//! full-fill + anonymous-trade out-of-line `#[cold]`. (2) `prefetch_event`
+//! `_mm_prefetch T0` on slab slot + bids/asks top, called one event ahead.
 //!
-//! [`HotOrderBook::apply_lanes`] (lane-separated 3-pass apply) was tried
-//! and **rejected** for realtime: correct (canonical hash bit-exact) but
-//! +8.8 % wall on the same input. Retained for future batch / offline use.
+//! `apply_lanes` (3-pass lane-separated apply) is **rejected** for realtime:
+//! correct (canonical hash bit-exact) but +8.8% wall. Retained for batch.
 
 use crate::event::{Event, EventType, Side};
 use crate::types::Price;
@@ -100,11 +87,24 @@ pub struct HotOrderBook<const MAX_LEVELS: usize = 256> {
 
 /// Per-order metadata: price it sits at, remaining qty, and side.
 /// Stored in a dense `Vec` (the slab); the hash index points to it by `u32`.
+///
+/// Layout pinned: 8 + 8 + 1 + 7 pad = 24 B, align 8. Adding fields here
+/// requires updating the compile-time `size_of` assert at the bottom of
+/// the module.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, align(8))]
 pub struct OrderMeta {
     pub price: u64,
     pub qty: u64,
     pub side: u8,
+    _pad: [u8; 7],
+}
+
+impl OrderMeta {
+    #[inline]
+    fn new(price: u64, qty: u64, side: u8) -> Self {
+        Self { price, qty, side, _pad: [0; 7] }
+    }
 }
 
 /// Slab-backed order index. Two layers:
@@ -150,17 +150,19 @@ impl OrderSlab {
     /// Borrow the metadata for `order_id`, mutably.
     #[inline]
     fn get_mut(&mut self, order_id: u64) -> Option<&mut OrderMeta> {
-        let slot = *self.index.get(&order_id)?;
-        // SAFETY: index entries always reference live slab slots.
-        Some(unsafe { self.data.get_unchecked_mut(slot as usize) })
+        let slot = *self.index.get(&order_id)? as usize;
+        debug_assert!(slot < self.data.len(), "slab index points to stale slot {slot}");
+        // SAFETY: index entries always reference live slab slots (debug-asserted).
+        Some(unsafe { self.data.get_unchecked_mut(slot) })
     }
 
     /// Borrow the metadata for `order_id`, immutably.
     #[inline]
     fn get(&self, order_id: u64) -> Option<&OrderMeta> {
-        let slot = *self.index.get(&order_id)?;
-        // SAFETY: index entries always reference live slab slots.
-        Some(unsafe { self.data.get_unchecked(slot as usize) })
+        let slot = *self.index.get(&order_id)? as usize;
+        debug_assert!(slot < self.data.len(), "slab index points to stale slot {slot}");
+        // SAFETY: index entries always reference live slab slots (debug-asserted).
+        Some(unsafe { self.data.get_unchecked(slot) })
     }
 
     /// Remove the metadata for `order_id`, returning the previous value.
@@ -206,28 +208,17 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         }
     }
 
-    /// **α prefetch hint** — issue a software prefetch for the slab slot
-    /// of the order referenced by `event` (TRADE / CANCEL / MODIFY) AND
-    /// for the top-of-book cache line of both sides of the price grid.
+    /// **α prefetch hint** — `_mm_prefetch T0` on the slab slot for the
+    /// referenced oid (TRADE / CANCEL / MODIFY) plus the top cache line
+    /// of both bid and ask grids. Call one event ahead of `apply()`.
     ///
-    /// Intended to be called *one or two events ahead* of the matching
-    /// `apply()` so the slot AND the level the binary search will touch
-    /// are L1-resident by the time the real lookup fires.
+    /// Both grid sides are prefetched unconditionally: at the prefetch
+    /// point the side is hidden behind the slab slot we're about to
+    /// fetch, and 2× 64 B prefetches cost ~2 cycles vs branching on
+    /// `is_bid`. ADD skips the slab prefetch (writes a fresh slot) but
+    /// still hits the grid (`add_order` does a binary-search insert).
     ///
-    /// Why prefetch both bid and ask top lines: at the prefetch point we
-    /// generally don't know the side without reading the slab slot
-    /// (which is itself the thing we're trying to bring in). Issuing
-    /// two unconditional prefetches on a tiny, hot, 64-byte-aligned
-    /// region costs ~2 cycles and removes the branch on `is_bid`.
-    /// `find_level` does a `partition_point` binary search which always
-    /// hits the first cache line of the side's level array sooner or
-    /// later (and very early when depth is shallow).
-    ///
-    /// ADD events skip the slab prefetch (they write a new slot, not
-    /// read an existing one) but still prefetch the level grid because
-    /// `add_order` itself does a binary-search insertion.
-    ///
-    /// No-op on non-x86_64 targets and when `order_id == 0`.
+    /// No-op on non-x86_64 and when `order_id == 0`.
     #[inline]
     pub fn prefetch_event(&self, event: &Event) {
         #[cfg(target_arch = "x86_64")]
@@ -265,48 +256,25 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         }
     }
 
-    /// **Lane-separated batch apply** — three homogeneous passes over a
-    /// window of events instead of one interleaved loop.
+    /// **Lane-separated batch apply** — three homogeneous passes
+    /// (ADD, TRADE, CANCEL) over a window of events. Keeps each pass's
+    /// working set L1-resident at the cost of triple loop overhead.
     ///
-    /// Pass 1: all ADDs (and the ADD half of MODIFYs)
-    /// Pass 2: all TRADEs
-    /// Pass 3: all CANCELs (and the CANCEL half of MODIFYs)
+    /// Status: **rejected for realtime** (+8.8 % wall vs serial `apply`,
+    /// see [`docs/latency-alpha.md`]). Retained for future offline /
+    /// pre-bucketed batch contexts where the type-filter cost vanishes.
     ///
-    /// ## Why this exists
+    /// ## Correctness
     ///
-    /// In an interleaved stream, the cache-line for the slab slot of
-    /// an order written by ADD #1 is typically evicted before the
-    /// matching TRADE #N arrives, because hundreds of unrelated ADDs
-    /// and CANCELs touched other slots in between. Each TRADE then
-    /// pays a cold-cache miss on the slab slot and on the price level.
+    /// Final post-batch state matches the interleaved `apply` loop on
+    /// any ITCH-conformant input: unique oids per ADD, CANCEL/TRADE
+    /// never precedes its ADD, MODIFY references a live oid. The lane
+    /// order ADD → TRADE → CANCEL ensures that intra-batch TRADEs
+    /// resolve against ADDs in pass 1 and intra-batch CANCELs see the
+    /// post-fill residual. Mid-batch snapshots DIFFER from the serial
+    /// loop — only the post-batch state is observable.
     ///
-    /// By processing all events of one type in a single pass, the
-    /// hot working set of that pass stays L1-resident: the slab slots
-    /// for the orders touched in this batch, the index buckets that
-    /// resolve them, and the contiguous price-level grid.
-    ///
-    /// ## Correctness (final state identical to interleaved `apply` loop)
-    ///
-    /// Holds for any event stream that satisfies ITCH semantics:
-    ///   * `order_id` is unique per ADD (no oid reuse within a batch);
-    ///   * CANCEL/TRADE for an oid never precedes its ADD;
-    ///   * MODIFY references an oid already present in the book.
-    ///
-    /// The lane ordering ADD → TRADE → CANCEL is chosen so that
-    /// within a single batch:
-    ///   - TRADEs against orders ADDed in this batch resolve correctly
-    ///     (slab populated by pass 1).
-    ///   - CANCELs of orders partially consumed by TRADEs cancel only
-    ///     the remaining qty (TRADE deducted its fill from the slab in
-    ///     pass 2).
-    ///   - Final level totals = sum over batch of (added − cancelled −
-    ///     traded) regardless of the intra-batch interleaving.
-    ///
-    /// Intermediate snapshots (mid-batch) ARE different from the
-    /// interleaved apply loop. This API is therefore appropriate for
-    /// settings where only the post-batch state is observable, which
-    /// is the standard case for an HFT engine that polls the book at
-    /// a fixed cadence.
+    /// Verified by `test_apply_lanes_matches_serial_canonical_hash`.
     pub fn apply_lanes(&mut self, events: &[Event]) -> usize {
         self.apply_lane_adds(events)
             + self.apply_lane_trades(events)
@@ -418,10 +386,6 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
     }
 
     /// Bid depth across top `n` levels.
-    ///
-    /// **L2**: Prefetch next cache line before the loop.
-    /// **L3**: 4-wide manual unroll lets the compiler emit `vpaddd`/`vpaddq`
-    /// on AVX2 or equivalent NEON — no explicit intrinsics needed.
     #[inline]
     pub fn bid_depth(&self, n: usize) -> u64 {
         Self::depth_sum(&self.bids, self.bid_count as usize, n)
@@ -433,28 +397,24 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         Self::depth_sum(&self.asks, self.ask_count as usize, n)
     }
 
-    /// **L3**: 4-wide unrolled depth sum — compiler auto-vectorizes this
-    /// into SIMD on x86-64 with `-C target-cpu=native`.
-    /// Prefetch hint (L2) at +2 cache lines ahead of the read cursor.
+    /// **L3**: 4-wide unrolled depth sum — 4 independent accumulators
+    /// let the compiler emit `vpaddq` on AVX2 (or `add` chains on NEON).
+    /// Tail handled with a `match` so each `dN` keeps an even share of
+    /// the work (otherwise auto-vec collapses on the tail iteration).
+    /// Prefetches the first 2 cache lines of `levels`.
     #[inline(always)]
     fn depth_sum(levels: &[Level; MAX_LEVELS], count: usize, n: usize) -> u64 {
         let n = n.min(count);
 
-        // L2: prefetch the first 2 cache lines of level data
         if n > 0 {
-            // SAFETY: pointer is within our own stack/heap allocation
+            #[cfg(target_arch = "x86_64")]
             unsafe {
-                let ptr = levels.as_ptr() as *const u8;
-                #[cfg(target_arch = "x86_64")]
-                {
-                    core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
-                    core::arch::x86_64::_mm_prefetch(ptr.add(64) as *const i8, core::arch::x86_64::_MM_HINT_T0);
-                }
-                let _ = ptr; // suppress unused on non-x86
+                let ptr = levels.as_ptr() as *const i8;
+                core::arch::x86_64::_mm_prefetch(ptr,           core::arch::x86_64::_MM_HINT_T0);
+                core::arch::x86_64::_mm_prefetch(ptr.add(64),   core::arch::x86_64::_MM_HINT_T0);
             }
         }
 
-        // L3: 4-wide unrolled accumulation — auto-vectorizable
         let mut d0: u64 = 0;
         let mut d1: u64 = 0;
         let mut d2: u64 = 0;
@@ -471,9 +431,22 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
             d3 += levels[base + 3].total_qty;
         }
 
-        let tail_base = chunks * 4;
-        for i in 0..remainder {
-            d0 += levels[tail_base + i].total_qty;
+        // Tail: distribute across accumulators to preserve 4-wide symmetry.
+        let tail = chunks * 4;
+        match remainder {
+            3 => {
+                d0 += levels[tail].total_qty;
+                d1 += levels[tail + 1].total_qty;
+                d2 += levels[tail + 2].total_qty;
+            }
+            2 => {
+                d0 += levels[tail].total_qty;
+                d1 += levels[tail + 1].total_qty;
+            }
+            1 => {
+                d0 += levels[tail].total_qty;
+            }
+            _ => {}
         }
 
         d0 + d1 + d2 + d3
@@ -503,14 +476,17 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
 
     /// **Canonical L2 hash** — cross-language verification primitive.
     ///
-    /// Produces an xxh3 digest over (price, total_qty) pairs from
-    /// best-bid down to worst-bid, then best-ask up to worst-ask.
-    /// This representation is identical across Rust/C++/Zig regardless
-    /// of internal storage, so two implementations agree iff the
-    /// observable L2 state agrees.
+    /// Produces an xxh3 digest over (price, total_qty) pairs, bids first
+    /// (descending) then asks (ascending). Identical scheme as C++ in
+    /// [`hotpath/src/ffi.cpp`](../../hotpath/src/ffi.cpp) `flowlab_orderbook_hash`.
+    ///
+    /// Note the deliberate asymmetry between level fold and side
+    /// separator: levels are **XOR-folded** into `h`, the `'|'`
+    /// separator **replaces** `h`. The C++ implementation does the same
+    /// — changing either side breaks cross-impl agreement.
     pub fn canonical_l2_hash(&self) -> u64 {
         let mut buf = [0u8; 16];
-        // Start with fixed domain tag so we can't collide with empty input
+        // Domain tag so empty book still hashes to a non-zero, namespaced value.
         let mut h = xxhash_rust::xxh3::xxh3_64(b"FLOWLAB-L2-v1");
 
         for l in self.bid_levels() {
@@ -518,7 +494,7 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
             buf[8..16].copy_from_slice(&l.total_qty.to_le_bytes());
             h ^= xxhash_rust::xxh3::xxh3_64_with_seed(&buf, h);
         }
-        // Side separator
+        // Side separator REPLACES h (matches C++); levels XOR-fold into h.
         h = xxhash_rust::xxh3::xxh3_64_with_seed(b"|", h);
         for l in self.ask_levels() {
             buf[0..8].copy_from_slice(&l.price.to_le_bytes());
@@ -586,10 +562,7 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
         };
 
         if level_ok && e.order_id != 0 {
-            self.orders.insert(
-                e.order_id,
-                OrderMeta { price, qty, side: e.side },
-            );
+            self.orders.insert(e.order_id, OrderMeta::new(price, qty, e.side));
         }
         level_ok
     }
@@ -792,6 +765,10 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
 const _: () = {
     // Level is 24 bytes (8-byte aligned)
     assert!(core::mem::size_of::<Level>() == 24);
+    // OrderMeta is 24 bytes (8-byte aligned) — keeps the slab dense
+    // and predictable across slot reuses.
+    assert!(core::mem::size_of::<OrderMeta>() == 24);
+    assert!(core::mem::align_of::<OrderMeta>() == 8);
     // HotOrderBook<256> is 64-byte aligned
     assert!(core::mem::align_of::<HotOrderBook<256>>() == 64);
 };

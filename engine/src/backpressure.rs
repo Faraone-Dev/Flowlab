@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Backpressure-aware bounded channel with drop counter.
 //!
 //! Wraps `crossbeam_channel::bounded`. The producer NEVER blocks: if the

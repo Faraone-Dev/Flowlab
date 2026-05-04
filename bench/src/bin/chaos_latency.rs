@@ -1,34 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Latency-distribution harness for the chaos detector chain.
 //!
-//! Why not Criterion: Criterion reports a confidence interval around
-//! the *mean*. For a per-event hot path we care about the **tail**:
-//! a single 5-µs hiccup inside a tight 50-ns inner loop is invisible
-//! at the mean but lethal for live use. This harness measures
-//! per-iteration ns/event, sorts, and reports p50 / p90 / p99 / max
-//! plus stddev for three datasets that exercise different branches:
+//! Criterion reports a CI around the *mean*; per-event hot paths care about
+//! tails. This harness sorts per-iter ns/event and reports p50/p90/p99/max
+//! + stddev over three datasets:
+//!   * `steady` — calm `realistic_events` (60/25/15)
+//!   * `bursty` — cancel-heavy (35/55/10), hammers storm baseline
+//!   * `crashy` — sweep+aggression bursts every 5k events
 //!
-//!   * `steady`  — calm `realistic_events` (60 % adds / 25 % cancels)
-//!   * `bursty`  — cancel-heavy stream (35 / 55 / 10) hammering the
-//!                 storm baseline and best-cache invalidation
-//!   * `crashy`  — `realistic_events` + injected sweep+aggression
-//!                 bursts every 5 000 events to actually fire the
-//!                 flash-crash and ignition branches under timing
-//!
-//! Methodology:
-//!   * Each dataset is generated once (deterministic seed).
-//!   * The chain is rebuilt per iteration so internal state does not
-//!     accumulate (matches `bench/chaos_throughput.rs`).
-//!   * One full warm-up pass is run before timing to populate
-//!     branch-predictor / page-walk / icache state.
-//!   * On Windows we set the current process affinity to a single
-//!     CPU core (`SetProcessAffinityMask`) for the duration of the
-//!     run. On other platforms this is a no-op.
-//!   * Iterations are measured with `Instant::now()`; resolution on
-//!     modern Windows is sub-µs (QPC-backed).
-//!
-//! Output is plain text, machine-friendly: one block per dataset,
-//! one row per detector configuration. Re-run after a code change
-//! and diff the rows.
+//! Chain rebuilt per iter (no state accumulation), one warm-up pass,
+//! Windows process pinned to single core (no-op elsewhere).
 
 use std::time::Instant;
 

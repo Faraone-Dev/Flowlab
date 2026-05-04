@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Fuzz #2 — ITCH parser robustness against arbitrary bytes.
 //!
 //! WHAT IT PROVES

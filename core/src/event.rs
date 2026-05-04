@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 use bytemuck::{Pod, Zeroable};
 
 /// Fixed-layout canonical event format — cross-language ABI.

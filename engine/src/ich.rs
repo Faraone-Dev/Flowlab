@@ -1,34 +1,22 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! IchSource — NASDAQ ITCH 5.0 file replay.
 //!
-//! Reuses the validated parser from `flowlab_replay::itch` (which is the
-//! Rust mirror of the Zig parser, hash-equivalent to it). We do not
-//! re-decode the protocol here; we only walk the byte stream message by
-//! message and emit canonical [`Event`]s on demand.
+//! Reuses the validated parser from `flowlab_replay::itch` (Rust mirror
+//! of the Zig parser, hash-equivalent). Walks the byte stream and emits
+//! canonical [`Event`]s on demand.
 //!
-//! ## Design
-//!
-//! * **mmap, zero-copy.** The whole BinaryFILE dump is mapped read-only.
-//!   `next()` returns events without ever allocating.
-//! * **Pull, not push.** The engine drives the cursor. No background
-//!   thread, no producer/consumer split inside the source.
-//! * **Skip ignored types.** ITCH is full of admin messages
-//!   (system events, MWCB, regsho, IPO quoting, etc.) — we walk past
-//!   them rather than failing, exactly like a production handler.
-//! * **Optional pacing.** Default is "as fast as possible" (good for
-//!   benchmarking the hot path under maximum load). `Pace::Realtime`
-//!   replays at wall-clock spacing derived from the ITCH 48-bit
-//!   nanosecond timestamps — useful when the dashboard should look
-//!   like a live tape.
-//! * **Live or finite.** When the file is exhausted, `next()` returns
-//!   `None` and `is_live()` is `false`, so the engine cleanly stops
-//!   instead of busy-looping.
-//!
-//! ## Honesty boundary
+//! - mmap, zero-copy: BinaryFILE dump mapped read-only, no allocs in `next()`.
+//! - Pull-based: engine drives the cursor; no background thread.
+//! - Skip ignored types (system events, MWCB, regsho, IPO, etc.) like a
+//!   production handler.
+//! - Pacing: `AsFastAsPossible` (default) or `Realtime { speedup }` from
+//!   ITCH ts48.
+//! - Finite source: `next() -> None` and `is_live() == false` on EOF.
 //!
 //! Both `event_time_ns` (ITCH ts48) and `process_time_ns` (engine
-//! monotonic) are in-process clocks here, both nanosecond-precise.
-//! Latency claims derived from this source are HFT-grade — exactly the
-//! point of replaying real NASDAQ data through the deterministic core.
+//! monotonic) are in-process clocks here, so latency claims are HFT-grade.
 
 use crate::source::Source;
 use flowlab_core::event::Event;

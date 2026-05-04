@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! E2E #3 — Stress burst + ring overflow.
 //!
 //! WHAT IT PROVES

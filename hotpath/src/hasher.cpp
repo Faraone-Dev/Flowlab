@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 #include "flowlab/hasher.h"
 
 // Use the official xxHash single-header implementation, inlined into this

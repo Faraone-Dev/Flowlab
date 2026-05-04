@@ -1,36 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Detector chain with stable output ordering.
 //!
-//! ## Why a single struct
+//! Single call site for the full chaos pipeline. Detectors are
+//! independent (each owns its mini-book + counters); order only
+//! affects flag ordering in the output vec, kept stable for
+//! reproducible tests/reports:
 //!
-//! Consumers (`lab::executor`, `bench/chaos_throughput`, future
-//! replay tooling) need a *single* call site that runs the full chaos
-//! analysis with predictable cost. Wiring five detectors by hand at
-//! every call site is brittle and makes ordering implicit. A chain
-//! type fixes the order, exposes default-tuned constructors for each
-//! detector, and gives a single hook for future additions.
+//!   1. PhantomLiquidity   2. CancellationStorm   3. MomentumIgnition
+//!   4. FlashCrash         5. LatencyArbProxy
 //!
-//! ## Ordering rationale
-//!
-//! Detectors are independent — each owns its mini-book and counters —
-//! so the order does not affect *correctness*. It does, however,
-//! affect the *order in which flags appear in the output vector* when
-//! a single event triggers more than one detector. We keep the order
-//! stable so test assertions and reports are reproducible:
-//!
-//!   1. PhantomLiquidity         — purely cancel-cycle topology
-//!   2. CancellationStorm        — adaptive rate baseline
-//!   3. MomentumIgnition         — sustained directional drift
-//!   4. FlashCrash               — instantaneous gap + vacuum
-//!   5. LatencyArbProxy          — reaction-to-print burst
-//!
-//! ## Default tuning
-//!
-//! `ChaosChain::default_itch()` builds a chain calibrated for raw ITCH
-//! 5.0 (US equities 100 µs cadence, 8-decimal price scale). The
-//! parameters are conservative: each detector aims for < 0.5 % flag
-//! rate on a clean trading day. They will be re-tuned (and pinned in
-//! `chaos/README.md`) once we have benchmark numbers from a real
-//! recording.
+//! `ChaosChain::default_itch()` ships conservative ITCH 5.0 tunings
+//! aiming for <0.5% flag rate on a clean session.
 
 use flowlab_core::event::SequencedEvent;
 

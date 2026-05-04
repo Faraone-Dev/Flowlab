@@ -1,47 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Latency histogram harness — per-event distribution of `HotOrderBook::apply`.
 //!
-//! ## Why this file exists
+//! Criterion gives `[low mean high]` on means, hiding tails (cache evictions,
+//! mispredict bursts, rehash stalls, page faults, scheduler preemption).
+//! This binary measures the **distribution shape** of every single `apply()`
+//! call across four phases.
 //!
-//! Criterion gives `[low mean high]` confidence intervals on the
-//! AVERAGE of N iterations. That hides every interesting failure mode
-//! of a low-latency engine:
+//! Clock: `rdtsc` (cycle-accurate, calibrated against `Instant`); QPC is
+//! ~100 ns granular and would quantise sub-100 ns samples.
 //!
-//!   * cache eviction spikes after long idle gaps,
-//!   * branch-mispredict bursts on rare event types,
-//!   * hash-index rehash stalls,
-//!   * scheduler preemption / interrupt service routines,
-//!   * page faults on first touch of a fresh slab slot,
-//!   * TLB pressure as the working set crosses 2 MB.
-//!
-//! This binary measures the **distribution shape** of every single
-//! `apply()` call across four phases.
-//!
-//! ## Clock — `rdtsc`
-//!
-//! `Instant::now()` on Windows uses `QueryPerformanceCounter` with
-//! ~100 ns granularity. That is wider than a single `apply()` (~30 ns
-//! on this engine), so per-call samples would be quantised to 0 and
-//! 100 ns. Useless.
-//!
-//! We use `rdtsc` instead — a CPU read of the time-stamp counter.
-//! Resolution: cycle-accurate (~0.25 ns at 4 GHz). Overhead: a few
-//! cycles. We calibrate the cycles→ns ratio against `Instant` once at
-//! startup and subtract a measured per-pair overhead from every sample.
-//!
-//! ## Phases
-//!
-//!   1. WARMUP        (not reported — populates slab, primes branches)
-//!   2. STEADY        realistic 60/25/15 add/cancel/trade
-//!   3. BURST         256-event bursts separated by 100 µs cold gaps
-//!   4. CANCEL-HEAVY  70% cancel / 30% add — maximum slab churn
-//!
-//! ## Interpretation
-//!
-//!   p50         : the everyday cost
-//!   p95 / p99   : load sensitivity, cache pressure
-//!   p99.9       : real tail behaviour an HFT venue cares about
-//!   max         : worst single-event spike (system instability)
-//!   p99.9/p50   : variance ratio — lower is more stable
+//! Phases: WARMUP (skip), STEADY 60/25/15, BURST 256-event with cold gaps,
+//! CANCEL-HEAVY 70/30. Reports p50 / p95 / p99 / p99.9 / max / p99.9÷p50.
 
 use std::time::Instant;
 
@@ -49,7 +20,7 @@ use flowlab_bench::{realistic_events, warmup_events, MarketConfig, XorShift64};
 use flowlab_core::event::{Event, EventType, SequencedEvent};
 use flowlab_core::hot_book::HotOrderBook;
 
-// ─── rdtsc clock ─────────────────────────────────────────────────────
+// rdtsc clock
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]

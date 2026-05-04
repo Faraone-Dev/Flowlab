@@ -1,17 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Engine — wires Source → HotOrderBook → analytics → telemetry.
 //!
-//! Single-threaded by default. The Source runs on the main thread; the TCP
-//! telemetry server runs on its own thread and consumes a bounded mpsc.
-//! Backpressure: see [`crate::backpressure`].
+//! Single-threaded by default. Source on main thread; TCP telemetry server
+//! on its own thread, bounded mpsc. Backpressure: see [`crate::backpressure`].
 //!
-//! Latency stages are measured around discrete spans:
-//!   - apply     : HotOrderBook::apply
-//!   - analytics : VPIN + imbalance + spread + regime
-//!   - risk      : CircuitBreaker::check (no-op when no intent — measured separately)
-//!   - wire-out  : encode + try_send
-//!
-//! `parse` is owned by the source (when it is a real protocol decoder).
-//! For SyntheticSource it is reported as 0.
+//! Latency stages: `apply`, `analytics`, `risk`, `wire-out`. `parse` is
+//! owned by the source (0 for SyntheticSource).
 
 use crate::backpressure::Producer;
 use crate::source::Source;

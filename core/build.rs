@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Build script for the `native` feature.
 //!
 //! Builds the C++ hot path in-tree via the `cc` crate (which auto-detects

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Chaos #2 — Partial corruption / noise injection.
 //!
 //! WHAT IT PROVES

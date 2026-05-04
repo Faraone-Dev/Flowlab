@@ -1,31 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Segmented Write-Ahead Log with per-record CRC-32 framing.
 //!
-//! The WAL is the system's ground truth: anything that has been
-//! acknowledged by the writer side can be replayed bit-exactly into
-//! any consumer (strategy, risk check, back-test) and will produce
-//! the *identical* [`flowlab_core::hot_book::HotOrderBook`] state
-//! hash observed live.
+//! Anything acked by the writer side can be replayed bit-exactly into any
+//! consumer and produces the *identical* [`flowlab_core::hot_book::HotOrderBook`]
+//! state hash observed live.
 //!
-//! On-disk layout (per record):
+//! Per-record on-disk layout:
 //!
 //! ```text
 //!   offset  size  field
-//!   0       4     len   (u32 little-endian)  — payload byte count
-//!   4       4     crc32 (u32 little-endian)  — CRC-32/IEEE over payload
+//!   0       4     len   (u32 LE)  — payload byte count
+//!   4       4     crc32 (u32 LE)  — CRC-32/IEEE over payload
 //!   8       len   payload
 //! ```
 //!
-//! Segment files are named `wal-<u64>.log`, numbered from 0 and
-//! rotated when they exceed the configured segment size. A torn tail
-//! is truncated on reopen so the next append resumes from a clean EOF.
-//!
-//! Durability model:
-//! - `append`: buffered write, O(1)
-//! - `sync`: explicit `fsync` — call after every trade you care about
-//! - `close`: drops the file handle, segments remain on disk
-//!
-//! This is NOT a distributed log. Replication is out of scope — we
-//! only guarantee crash-consistency on a single node.
+//! Segments named `wal-<u64>.log`, rotated by size. Torn tail truncated on
+//! reopen. `append` buffered O(1); `sync` calls `fsync`; not distributed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};

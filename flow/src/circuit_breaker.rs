@@ -1,26 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //! Trading-side risk gate: composable pre-trade + in-flight checks.
 //!
-//! The circuit breaker is the last line of defense before any order
-//! reaches the wire. All paths that can generate an outbound order
-//! MUST call [`CircuitBreaker::check`] with a prospective [`Intent`]
+//! Last line of defense before any order reaches the wire. All paths
+//! that can generate an outbound order MUST call [`CircuitBreaker::check`]
 //! and respect its [`Decision`].
 //!
-//! Guards implemented:
+//! | Guard            | Trigger                                                        |
+//! | ---------------- | -------------------------------------------------------------- |
+//! | Rate limit       | Token bucket (orders/sec)                                      |
+//! | Position cap     | `abs(net_pos(instrument)) + order_qty > max_position`          |
+//! | Daily-loss floor | `realized_pnl_cents < -max_daily_loss_cents`                   |
+//! | OTR ceiling      | `orders_sent / max(1, trades_done) > max_order_to_trade_ratio` |
+//! | Feed health      | `recent_gap_count >= gap_threshold` within rolling window      |
+//! | Manual kill      | Atomic latch flipped by operator / supervisor                  |
 //!
-//! | Guard             | Trigger                                                          |
-//! | ----------------- | ---------------------------------------------------------------- |
-//! | Rate limit        | Token bucket (orders/sec)                                        |
-//! | Position cap      | `abs(net_pos(instrument)) + order_qty > max_position`            |
-//! | Daily-loss floor  | `realized_pnl_cents < -max_daily_loss_cents`                     |
-//! | OTR ceiling       | `orders_sent / max(1, trades_done) > max_order_to_trade_ratio`   |
-//! | Feed health       | `recent_gap_count >= gap_threshold` within the rolling window    |
-//! | Manual kill       | Atomic latch flipped by operator / supervisor                    |
-//!
-//! Once any guard trips, the breaker **latches**: every subsequent
-//! [`CircuitBreaker::check`] returns `Decision::Block(reason)` until
-//! [`CircuitBreaker::reset`] is called explicitly. This is the HFT
-//! equivalent of "fail closed" — recovery is a deliberate operator
-//! action, never automatic.
+//! Once any guard trips the breaker **latches** — every subsequent
+//! `check` returns `Block(reason)` until [`CircuitBreaker::reset`] is
+//! called explicitly. Fail closed: recovery is deliberate, never automatic.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
