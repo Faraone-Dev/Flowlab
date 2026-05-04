@@ -66,9 +66,19 @@ func (f *WebSocketFeed) Dropped() uint64 {
 // Run blocks until Stop() is called. Intended to be launched as
 // `go feed.Run()` by the caller; the WaitGroup add/done lives here so
 // Stop() can wait for the loop to fully unwind.
+// Reconnect backoff bounds. Exponential 1s → 2s → 4s → … capped
+// at maxBackoff. Reset to initial on every successful connect so a
+// flaky link that recovers does not stay penalised forever.
+const (
+	initialBackoff = 1 * time.Second
+	maxBackoff     = 30 * time.Second
+)
+
 func (f *WebSocketFeed) Run() {
 	f.wg.Add(1)
 	defer f.wg.Done()
+
+	backoff := initialBackoff
 
 	for {
 		select {
@@ -78,16 +88,27 @@ func (f *WebSocketFeed) Run() {
 		}
 
 		if err := f.connect(); err != nil {
-			log.Printf("connection failed: %v, retrying in 1s", err)
-			// Cancellable sleep: don't block Stop() for a full second.
+			log.Printf("connection failed: %v, retrying in %s", err, backoff)
+			// Cancellable sleep: don't block Stop() for a full backoff.
 			select {
 			case <-f.stop:
 				return
-			case <-time.After(time.Second):
+			case <-time.After(backoff):
+			}
+			// Exponential growth, capped. No jitter here: a single
+			// producer reconnecting to one venue does not need it,
+			// and determinism makes the backoff easy to reason about
+			// in tests.
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 			continue
 		}
 
+		// Successful connect → reset the penalty so a transient
+		// disconnect after a long healthy session retries fast.
+		backoff = initialBackoff
 		f.readLoop()
 	}
 }

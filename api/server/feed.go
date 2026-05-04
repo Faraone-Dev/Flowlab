@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 package server
 
 import (
@@ -211,22 +214,20 @@ func (f *SyntheticFeed) Next() Tick {
 		}
 	}
 
-	// ── regime classification (mirrors flow/src/regime.rs thresholds).
-	score := math.Max(0, f.spread/baseSpread-1.0) +
-		math.Abs(imb)*2.0 +
-		f.vpin*5.0 +
-		math.Max(0, f.tradeVel-1.0)
-	var regime uint8
-	switch {
-	case score >= 6.0:
-		regime = 3
-	case score >= 3.0:
-		regime = 2
-	case score >= 1.5:
-		regime = 1
-	default:
-		regime = 0
-	}
+	// ── regime classification — MUST stay in lockstep with the Rust
+	//    canonical classifier in `flow/src/regime.rs`. The synthetic
+	//    feed has no mid-drift / crossed-book / depth-depletion
+	//    inputs, so they are passed as zeros (the Rust classifier
+	//    handles those defaults identically). Parity is locked in
+	//    by `regime_parity_test.go`; if that test fails, fix THIS
+	//    function — never the test vectors — to match Rust.
+	regime := classifyRegime(regimeInput{
+		spreadBlowoutRatio: f.spread / baseSpread,
+		bookImbalance:      imb,
+		vpin:               f.vpin,
+		tradeVelocityRatio: f.tradeVel,
+		eventsPerSec:       uint64(eps),
+	})
 
 	// ── gaps: very rare spike under stress.
 	if f.rng.Float64() < f.stress*0.02 {

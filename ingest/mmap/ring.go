@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ivan Piardi (Faraone-Dev)
+
 //go:build linux || darwin || freebsd
 
 package mmap
