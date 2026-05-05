@@ -12,8 +12,11 @@
 use crate::backpressure::Producer;
 use crate::source::Source;
 use crate::wire::{
-    BookFrame, Header, LatFrame, Level, RiskFrame, StageLat, TelemetryFrame, TickFrame, TradeFrame,
+    BookFrame, ChaosFrame, Header, LatFrame, Level, RiskFrame, StageLat, TelemetryFrame, TickFrame,
+    TradeFrame,
 };
+use flowlab_chaos::chain::ChaosChain;
+use flowlab_chaos::ChaosEvent;
 use flowlab_core::event::EventType;
 use flowlab_core::hot_book::HotOrderBook;
 use flowlab_flow::imbalance::book_imbalance;
@@ -190,6 +193,11 @@ pub struct Engine {
     window_started: Instant,
     last_eps: u64,
     last_trade_vel: f64,
+
+    // chaos detection pipeline
+    chaos_chain: ChaosChain,
+    /// Reusable buffer for chaos detection output (zero per-event alloc).
+    chaos_buf: Vec<ChaosEvent>,
 }
 
 #[inline]
@@ -201,6 +209,20 @@ fn halt_reason_name(r: HaltReason) -> String {
         HaltReason::OrderToTradeRatio => "order_to_trade_ratio",
         HaltReason::FeedGap => "feed_gap",
         HaltReason::Manual => "manual",
+    }
+    .to_string()
+}
+
+#[inline]
+fn chaos_kind_name(k: flowlab_chaos::ChaosKind) -> String {
+    match k {
+        flowlab_chaos::ChaosKind::QuoteStuff => "QuoteStuff",
+        flowlab_chaos::ChaosKind::PhantomLiquidity => "PhantomLiquidity",
+        flowlab_chaos::ChaosKind::Spoof => "Spoof",
+        flowlab_chaos::ChaosKind::CancellationStorm => "CancellationStorm",
+        flowlab_chaos::ChaosKind::MomentumIgnition => "MomentumIgnition",
+        flowlab_chaos::ChaosKind::FlashCrash => "FlashCrash",
+        flowlab_chaos::ChaosKind::LatencyArbitrage => "LatencyArbitrage",
     }
     .to_string()
 }
@@ -253,6 +275,9 @@ impl Engine {
             window_started: Instant::now(),
             last_eps: 0,
             last_trade_vel: 0.0,
+
+            chaos_chain: ChaosChain::default_itch(),
+            chaos_buf: Vec::with_capacity(8),
         }
     }
 
@@ -415,6 +440,25 @@ impl Engine {
             let apply_ns = self.tsc.delta_ns(t0, crate::tsc::rdtsc());
             self.apply_stats.push(apply_ns);
             self.histo.record(apply_ns);
+
+            // ── chaos detection ──
+            self.chaos_buf.clear();
+            let seq_ev = flowlab_core::event::SequencedEvent {
+                seq: self.seq,
+                channel_id: 0,
+                event: ev,
+            };
+            self.chaos_chain.process_into(&seq_ev, &mut self.chaos_buf);
+            for ce in self.chaos_buf.drain(..) {
+                out.try_send(TelemetryFrame::Chaos(ChaosFrame {
+                    seq: self.seq,
+                    kind: chaos_kind_name(ce.kind),
+                    severity: ce.severity,
+                    start_seq: ce.start_seq,
+                    end_seq: ce.end_seq,
+                    initiator: ce.initiator,
+                }));
+            }
 
             // ── analytics (only on trades / on imbalance refresh)
             let t1 = crate::tsc::rdtsc();

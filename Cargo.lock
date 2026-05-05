@@ -410,6 +410,7 @@ dependencies = [
  "bincode",
  "clap",
  "crossbeam-channel",
+ "flowlab-chaos",
  "flowlab-core",
  "flowlab-flow",
  "flowlab-replay",

@@ -56,6 +56,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			tick := s.feed.Next()
 			tick.Symbol, tick.InstrumentID = s.feed.Symbol()
 			tick.Trades = s.feed.RecentTrades()
+			tick.Chaos = s.feed.RecentChaos()
 			if s.recorder != nil {
 				s.recorder.LogTick(tick)
 			}

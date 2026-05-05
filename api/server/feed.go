@@ -32,6 +32,21 @@ type TradePrint struct {
 	Aggressor  int8   `json:"aggressor"`
 }
 
+// ChaosFlag is one chaos-detector trigger surfaced to the dashboard.
+// Mirrors the engine-side `ChaosFrame` (engine/src/wire.rs).
+//
+// `Kind` is a stable label ("PhantomLiquidity", "CancellationStorm",
+// "MomentumIgnition", "FlashCrash", "LatencyArbProxy", "QuoteStuff",
+// "Spoof"). `Severity` is normalised to [0,1].
+type ChaosFlag struct {
+	Seq       uint64  `json:"seq"`
+	Kind      string  `json:"kind"`
+	Severity  float64 `json:"severity"`
+	StartSeq  uint64  `json:"start_seq"`
+	EndSeq    uint64  `json:"end_seq"`
+	Initiator *uint64 `json:"initiator,omitempty"`
+}
+
 // StageLatencies breaks down the engine pipeline. Zero values when the
 // synthetic feed is driving (it has no real stages to measure).
 type StageLatencies struct {
@@ -80,6 +95,7 @@ type Tick struct {
 	Symbol          string         `json:"symbol"`
 	InstrumentID    uint32         `json:"instrument_id"`
 	Trades          []TradePrint   `json:"trades,omitempty"`
+	Chaos           []ChaosFlag    `json:"chaos,omitempty"`
 }
 
 // SyntheticFeed produces ticks with realistic correlation between metrics.
@@ -349,6 +365,10 @@ func (f *SyntheticFeed) Symbol() (string, uint32) { return "SYNTH", 0 }
 
 // RecentTrades is a no-op for the synthetic feed — no trade prints.
 func (f *SyntheticFeed) RecentTrades() []TradePrint { return nil }
+
+// RecentChaos is a no-op for the synthetic feed — chaos detection only
+// runs inside the Rust engine.
+func (f *SyntheticFeed) RecentChaos() []ChaosFlag { return nil }
 
 func clamp01(x float64) float64 {
 	if x < 0 {

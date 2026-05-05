@@ -37,6 +37,9 @@ pub enum TelemetryFrame {
     Trade(TradeFrame),
     /// Heartbeat — empty payload, used to keep TCP alive on idle live feeds.
     Heartbeat,
+    /// Chaos detection flag — one per event that triggers a detector.
+    /// Emitted immediately after the event is applied (not at tick cadence).
+    Chaos(ChaosFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +143,23 @@ pub struct TradeFrame {
     pub price_ticks: u64,
     pub qty: u64,
     pub aggressor: i8,
+}
+
+/// Chaos detection flag emitted when a detector triggers.
+/// Mirrors `ChaosKind` + `ChaosEvent` from the chaos crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChaosFrame {
+    /// Engine sequence number at the triggering event.
+    pub seq: u64,
+    /// Human-readable kind label, e.g. "PhantomLiquidity", "FlashCrash".
+    pub kind: String,
+    /// Normalized severity [0.0, 1.0].
+    pub severity: f64,
+    /// Sequence range of the detected pattern.
+    pub start_seq: u64,
+    pub end_seq: u64,
+    /// Order ID that initiated the pattern (if identifiable).
+    pub initiator: Option<u64>,
 }
 
 /// Wire codec — bincode (binary, fast) or JSON (debug, human-readable).

@@ -28,6 +28,7 @@ type Feed interface {
 	Reset()
 	Symbol() (name string, instrumentID uint32)
 	RecentTrades() []TradePrint
+	RecentChaos() []ChaosFlag
 }
 
 // ── Engine wire types ──────────────────────────────────────────────────
@@ -112,6 +113,15 @@ type engineBook struct {
 	Asks []engineLevel `json:"asks"`
 }
 
+type engineChaos struct {
+	Seq       uint64  `json:"seq"`
+	Kind      string  `json:"kind"`
+	Severity  float64 `json:"severity"`
+	StartSeq  uint64  `json:"start_seq"`
+	EndSeq    uint64  `json:"end_seq"`
+	Initiator *uint64 `json:"initiator,omitempty"`
+}
+
 // EngineClient dials a flowlab-engine telemetry socket and continuously
 // decodes frames into the latest published Tick. It survives the engine
 // process restarting: after a disconnect we sleep with backoff and redial.
@@ -145,10 +155,15 @@ type EngineClient struct {
 	trades   []TradePrint // append-only cap tradeRingCap
 	tradeSeq uint64
 
+	// Chaos flag ring (last N detector triggers).
+	chaosMu sync.Mutex
+	chaos   []ChaosFlag // append-only cap chaosRingCap
+
 	startedAt time.Time
 }
 
 const tradeRingCap = 128
+const chaosRingCap = 64
 
 // NewEngineClient returns an unstarted client. Call Start() to begin
 // reading frames in the background.
@@ -200,6 +215,19 @@ func (c *EngineClient) RecentTrades() []TradePrint {
 	}
 	out := make([]TradePrint, len(c.trades))
 	copy(out, c.trades)
+	return out
+}
+
+// RecentChaos returns a copy of the last N chaos detector triggers,
+// oldest first. Mirrors RecentTrades.
+func (c *EngineClient) RecentChaos() []ChaosFlag {
+	c.chaosMu.Lock()
+	defer c.chaosMu.Unlock()
+	if len(c.chaos) == 0 {
+		return nil
+	}
+	out := make([]ChaosFlag, len(c.chaos))
+	copy(out, c.chaos)
 	return out
 }
 
@@ -409,6 +437,25 @@ func (c *EngineClient) dispatchJSON(payload []byte) {
 			}
 			c.trades = append(c.trades, tp)
 			c.tradesMu.Unlock()
+		case "Chaos":
+			var ec engineChaos
+			if json.Unmarshal(v, &ec) != nil {
+				continue
+			}
+			cf := ChaosFlag{
+				Seq:       ec.Seq,
+				Kind:      ec.Kind,
+				Severity:  ec.Severity,
+				StartSeq:  ec.StartSeq,
+				EndSeq:    ec.EndSeq,
+				Initiator: ec.Initiator,
+			}
+			c.chaosMu.Lock()
+			if len(c.chaos) >= chaosRingCap {
+				c.chaos = append(c.chaos[:0], c.chaos[1:]...)
+			}
+			c.chaos = append(c.chaos, cf)
+			c.chaosMu.Unlock()
 		}
 	}
 }
