@@ -30,6 +30,10 @@ harness = false
 name = "chaos_throughput"
 harness = false
 
+[[bench]]
+name = "clustering_throughput"
+harness = false
+
 [[bin]]
 name = "latency_apply"
 path = "src/bin/latency_apply.rs"

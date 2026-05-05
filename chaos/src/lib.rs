@@ -16,6 +16,7 @@ pub mod window;
 
 pub use cancellation_storm::CancellationStormDetector;
 pub use chain::ChaosChain;
+pub use clustering::{ChaosCluster, ChaosClusterer};
 pub use detection::{QuoteStuffDetector, SpoofDetector};
 pub use flash_crash::FlashCrashDetector;
 pub use generators::{
