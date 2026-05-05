@@ -66,11 +66,15 @@ struct Stats {
 /// distribution.
 fn measure_chain(stream: &[SequencedEvent], iters: usize) -> Stats {
     // ── Warm up: one full pass to prime branch predictor / icache.
+    //    Uses the same zero-alloc API the timed loop does.
     {
         let mut chain = ChaosChain::default_itch();
+        let mut buf = Vec::with_capacity(8);
         let mut sink: u64 = 0;
         for ev in stream {
-            sink = sink.wrapping_add(chain.process(ev).len() as u64);
+            buf.clear();
+            chain.process_into(ev, &mut buf);
+            sink = sink.wrapping_add(buf.len() as u64);
         }
         std::hint::black_box(sink);
     }
@@ -80,10 +84,14 @@ fn measure_chain(stream: &[SequencedEvent], iters: usize) -> Stats {
 
     for _ in 0..iters {
         let mut chain = ChaosChain::default_itch();
+        // One buffer for the whole pass — what the harness is actually
+        // claiming to measure (per-event chain cost, not allocator cost).
+        let mut buf = Vec::with_capacity(8);
         let t0 = Instant::now();
         for ev in stream {
-            let flags = chain.process(std::hint::black_box(ev));
-            std::hint::black_box(&flags);
+            buf.clear();
+            chain.process_into(std::hint::black_box(ev), &mut buf);
+            std::hint::black_box(&buf);
         }
         let elapsed_ns = t0.elapsed().as_nanos() as f64;
         let per_event_ns = elapsed_ns / stream.len() as f64;
