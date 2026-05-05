@@ -1,4 +1,4 @@
-# FLOWLAB
+# ⚡ FLOWLAB
 
 **Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
@@ -10,22 +10,40 @@ React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
 recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 [`dashboard/`](dashboard/), [`api/`](api/) and [`engine/`](engine/).
 
+> [!IMPORTANT]
+> 📄 **Latency documents:**
+> - 📈 [`docs/latency-alpha.md`](docs/latency-alpha.md) — α optimisation log: **intrinsic share flip 25 % → 73 %** (cache-bound → compute-bound), rejected alternatives kept with diagnosis
+> - 🔁 [`docs/latency-cross-hw.md`](docs/latency-cross-hw.md) — `HotOrderBook<256>` **TOTAL p50 = 22 ns** reproduced **5/5 across two CPU generations** (AMD Ryzen + Intel i7), zero variance on p50
+
+### TL;DR
+
+| Signal | Value |
+| --- | --- |
+| `HotOrderBook::apply` TOTAL p50 (5/5 cross-CPU) | **22 ns** |
+| Cross-impl L2 hash agreement (Rust ↔ Zig ↔ C++) | `0xf54ce1b763823e87` |
+| Tests | **150** (128 Rust + 12 Zig + 10 Go) |
+| Canonical `Event` ABI | **40 B**, frozen, `#[repr(C)]` |
+| Risk gate guards | **6**, fail-closed, latching |
+| Live storm injectors | **5** (Phantom · Cancel · Ignition · Crash · Lat-Arb) |
+
 Multi-language pipeline for market-data replay, microstructure analytics,
 HFT aggression detection, and **adversarial bot stress-testing** under
 controlled storm conditions. Same input bytes produce identical state,
 byte-for-byte, across runs and platforms.
 
-> Research and simulation framework. Not a trading system.
+> [!WARNING]
+> **Research and simulation framework. Not a trading system.**
 >
 > **Modeled:** deterministic order flow replay, microstructure analytics,
 > chaos pattern detection, live adversarial storms against a third-party
 > trading bot (TARGET), audit-grade run recording.
+>
 > **Not modeled:** market impact, queue position, fill probability,
 > exchange matching, latency arbitrage outcomes, real PnL.
 
 ---
 
-## Positioning
+## 🧭 Positioning
 
 **flowlab is the deterministic data + analytics substrate an HFT
 research stack sits on top of — it is not the full trading stack.**
@@ -47,7 +65,7 @@ built on; it does not pretend to be that layer.
 
 ---
 
-## Core principles
+## 📐 Core principles
 
 - **Determinism first.** Sequence-driven execution. Wall-clock time is
   informational; it is never an input to ordering.
@@ -63,7 +81,7 @@ built on; it does not pretend to be that layer.
 
 ---
 
-## Language responsibilities
+## 🗂️ Language responsibilities
 
 The project is **Rust-core**: ~80% of the code (and the entire
 deterministic state machine, replay, WAL, risk gate, analytics) is
@@ -82,7 +100,7 @@ GC or syscalls beyond `read` / `mmap`.
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -111,7 +129,7 @@ GC or syscalls beyond `read` / `mmap`.
 
 ---
 
-## Canonical event (frozen ABI)
+## 🧱 Canonical event (frozen ABI)
 
 ```
 offset  size  field
@@ -136,7 +154,7 @@ Properties:
 
 ---
 
-## Live runtime + dashboard
+## 📡 Live runtime + dashboard
 
 The deterministic core can be driven by a runtime binary that exposes a
 versioned telemetry stream over TCP. A Go bridge consumes that stream
@@ -203,7 +221,7 @@ runtime at all — the React bundle is just static files served by Go.
 
 ---
 
-## Adversarial desk
+## 🌪️ Adversarial desk
 
 The dashboard is also a **stress-testing console** against a real
 external trading bot (the *target*). Five chaos kinds can be fired
@@ -369,7 +387,7 @@ zeroed target fields and a `bot_unreachable` event in `events.jsonl`.
 
 ---
 
-## Inter-language data path
+## 🔗 Inter-language data path
 
 No serialization layer exists between ingest and core.
 
@@ -403,7 +421,7 @@ never observes a partial batch.
 
 ---
 
-## Durability & recovery
+## 💾 Durability & recovery
 
 | Component                     | Guarantee                                                |
 | ----------------------------- | -------------------------------------------------------- |
@@ -418,7 +436,7 @@ L2 hash `0xf54ce1b763823e87` over 5000 events.
 
 ---
 
-## Risk gate
+## 🛡️ Risk gate
 
 [flow/src/circuit_breaker.rs](flow/src/circuit_breaker.rs) is the last
 line of defence before any outbound order. Every submission path MUST
@@ -438,7 +456,7 @@ Fail-closed, always.
 
 ---
 
-## Determinism model
+## 🔁 Determinism model
 
 ### Sequencing
 
@@ -521,7 +539,7 @@ No partial state mutation is ever allowed. Atomic all-or-nothing.
 
 ---
 
-## Performance discipline
+## ⚡ Performance discipline
 
 Rules enforced in code review and CI.
 
@@ -546,7 +564,7 @@ mismatches and memory churn.
 
 ---
 
-## Project layout
+## 🗺️ Project layout
 
 ```
 flowlab/
@@ -579,7 +597,7 @@ contract.
 
 ---
 
-## Build
+## 🔨 Build
 
 ```bash
 # full build (portable Rust + Zig + C++ + Go)
@@ -608,7 +626,7 @@ Prerequisites for `--features native`:
 
 ---
 
-## Test
+## 🧪 Test
 
 ```bash
 cargo test --workspace                              # pure Rust
@@ -654,7 +672,7 @@ convention, not loose organization.
 
 ---
 
-## Benchmarks
+## 📈 Benchmarks
 
 ```bash
 cargo bench -p flowlab-bench                        # pipeline, replay
@@ -719,7 +737,7 @@ them on your own hardware before quoting.
 
 ---
 
-## Continuous integration
+## 🤖 Continuous integration
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every
 push and pull request:
@@ -734,7 +752,7 @@ CI is the source of truth for cross-platform determinism.
 
 ---
 
-## What is real, what is WIP
+## ✅ What is real, what is WIP
 
 FLOWLAB documents both. Reviewers are expected to read source, not
 banners.
@@ -775,7 +793,7 @@ banners.
 | Windows mmap ring writer | Linux/macOS/FreeBSD only; Windows path returns an explicit error and recommends WSL | [ingest/mmap/ring_windows.go](ingest/mmap/ring_windows.go) |
 | Control API | `/health` and `/status` only; `/metrics` and `/ingest/*` are TODO | [api/server/server.go](api/server/server.go) |
 
-## Out of scope
+## 🚫 Out of scope
 
 - Live trading
 - Production exchange connectivity
@@ -787,7 +805,7 @@ operate on replayed data.
 
 ---
 
-## License
+## 📜 License
 
 Proprietary — see [LICENSE](LICENSE). All rights reserved.
 
