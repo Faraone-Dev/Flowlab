@@ -85,6 +85,14 @@ absolute terms. Detector internals still own bounded structures
 the per-event output allocation, which is the one the *caller* pays
 on every event regardless of whether anything fired.
 
+## Design notes
+
+Module-level design docs live under [`docs/`](docs/):
+
+- [`docs/clustering-policy.md`](docs/clustering-policy.md) — `ChaosClusterer`
+  merge policy (kind + initiator + dual seq/time window), composite
+  severity formula, what we did NOT do, bench numbers.
+
 ## Calibration table — `default_itch()`
 
 Tuned for raw ITCH 5.0 streams (US equities, ~100 µs cadence,
