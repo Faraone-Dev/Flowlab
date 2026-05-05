@@ -110,9 +110,18 @@ impl ChaosChain {
         )
     }
 
+    /// Run the full chain into a caller-owned buffer; **no per-event allocation**.
+    ///
+    /// `out` is appended to (not cleared) so the caller controls reuse policy:
+    /// either pass a fresh `Vec` per event for ergonomic use, or — in a hot
+    /// loop — `out.clear()` and reuse the same buffer across millions of events
+    /// to keep the chain at zero heap traffic.
+    ///
+    /// Output ordering is the documented stable order:
+    /// QuoteStuff → Spoof → PhantomLiquidity → CancellationStorm →
+    /// MomentumIgnition → FlashCrash → LatencyArbProxy.
     #[inline]
-    pub fn process(&mut self, seq_event: &SequencedEvent) -> Vec<ChaosEvent> {
-        let mut out: Vec<ChaosEvent> = Vec::new();
+    pub fn process_into(&mut self, seq_event: &SequencedEvent, out: &mut Vec<ChaosEvent>) {
         if let Some(e) = self.quote.process(seq_event) {
             self.bump(&e);
             out.push(e);
@@ -141,6 +150,15 @@ impl ChaosChain {
             self.bump(&e);
             out.push(e);
         }
+    }
+
+    /// Ergonomic wrapper around [`Self::process_into`] that allocates a fresh
+    /// `Vec` per event. Convenient at one-off call sites and tests; for hot
+    /// loops prefer `process_into` with a reused buffer.
+    #[inline]
+    pub fn process(&mut self, seq_event: &SequencedEvent) -> Vec<ChaosEvent> {
+        let mut out: Vec<ChaosEvent> = Vec::new();
+        self.process_into(seq_event, &mut out);
         out
     }
 
@@ -268,5 +286,61 @@ mod tests {
 
         assert!(seen);
         assert!(chain.count(ChaosKind::QuoteStuff) >= 1);
+    }
+
+    /// `process` and `process_into` must produce identical kind sequences
+    /// over an identical event stream — they share the same body and the
+    /// only diff is who owns the buffer. This test pins that contract so a
+    /// future refactor cannot accidentally diverge the two APIs.
+    #[test]
+    fn process_into_matches_process() {
+        // Same script as the phantom-liquidity test, plus a quote-stuff burst
+        // so we exercise multiple detector branches.
+        let stream: Vec<SequencedEvent> = {
+            let mut s = Vec::new();
+            s.push(ev(1, 1_000, EventType::OrderAdd, Side::Bid, 10_000, 1_000, 42));
+            s.push(ev(5, 5_000, EventType::OrderCancel, Side::Bid, 10_000, 1_000, 42));
+            for i in 0..4 {
+                let seq = 100 + i;
+                s.push(ev(seq, seq * 1_000, EventType::Trade, Side::Ask, 10_001, 100, seq));
+            }
+            for i in 0..36 {
+                let seq = 200 + i;
+                s.push(ev(seq, seq * 1_000, EventType::OrderCancel, Side::Bid, 9_999, 100, seq));
+            }
+            s
+        };
+
+        let mut a = ChaosChain::default_itch();
+        let from_alloc: Vec<ChaosKind> = stream
+            .iter()
+            .flat_map(|e| a.process(e).into_iter().map(|f| f.kind))
+            .collect();
+
+        let mut b = ChaosChain::default_itch();
+        let mut buf: Vec<ChaosEvent> = Vec::with_capacity(8);
+        let mut from_into: Vec<ChaosKind> = Vec::new();
+        for e in &stream {
+            buf.clear();
+            b.process_into(e, &mut buf);
+            from_into.extend(buf.iter().map(|f| f.kind));
+        }
+
+        assert_eq!(
+            from_alloc, from_into,
+            "process and process_into diverged: alloc={from_alloc:?} into={from_into:?}"
+        );
+        // Counters must agree too — they're updated by the same `bump`.
+        for k in [
+            ChaosKind::QuoteStuff,
+            ChaosKind::Spoof,
+            ChaosKind::PhantomLiquidity,
+            ChaosKind::CancellationStorm,
+            ChaosKind::MomentumIgnition,
+            ChaosKind::FlashCrash,
+            ChaosKind::LatencyArbitrage,
+        ] {
+            assert_eq!(a.count(k), b.count(k), "counter mismatch for {k:?}");
+        }
     }
 }
