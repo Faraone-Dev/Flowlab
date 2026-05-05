@@ -18,22 +18,35 @@
 //!
 //! The current policy is:
 //!
-//! 1. **Same kind, same initiator**         → always merge if seq-close.
+//! 1. **Same kind, same initiator**         → always merge if seq/time-close.
 //! 2. **Different initiator, same kind**    → never merge (different actors).
-//! 3. **Crash ↔ Ignition** (related kinds)  → merge if seq-close, regardless
-//!    of initiator (the price move is the shared substrate).
+//! 3. **Crash ↔ Ignition** (related kinds)  → merge if seq/time-close,
+//!    regardless of initiator (the price move is the shared substrate).
 //! 4. Otherwise                             → never merge.
 //!
-//! "Seq-close" means `event.start_seq <= current.end_seq + max_gap`.
+//! ## Dual window: seq + time
+//!
+//! Two events count as "close" iff EITHER
+//!
+//! * `event.start_seq <= current.end_seq + max_gap`, OR
+//! * `event.start_ts_ns <= current.end_ts_ns + max_time_gap_ns`
+//!
+//! is true. Mirrors the dual-window policy already used inside
+//! `PhantomLiquidity` so a feed with bursty latency (sequence numbers
+//! jumping while wall-clock barely moves) does not artificially split an
+//! episode. Either window can be disabled by passing `0` — with both
+//! disabled, no two events ever merge.
 //!
 //! ## Limits (honest)
 //!
-//! * Pure seq-window merge — feeds with bursty latency can drift and split
-//!   one episode into two. The seq+time dual window lives in a separate
-//!   commit; this file does not own that decision.
 //! * Initiators are compared by `Option<u64>` equality. Two `None`
 //!   initiators do **not** count as "same" — `None` means "unknown",
 //!   not "anonymous shared actor".
+//! * `start_ts_ns` is detector-supplied. Detectors that work on rolling
+//!   windows (QuoteStuff, CancellationStorm) report the head of the
+//!   triggering window; detectors that track explicit start events
+//!   (Phantom, Spoof, Ignition, Crash, LatencyArbProxy) report the
+//!   start event's wall-clock ts.
 
 use crate::{ChaosEvent, ChaosKind};
 use flowlab_core::types::SeqNum;
@@ -41,13 +54,24 @@ use flowlab_core::types::SeqNum;
 /// Episode clusterer for [`ChaosEvent`] streams.
 pub struct ChaosClusterer {
     /// Maximum sequence gap between two events to be considered the same
-    /// episode under the merge policy described at module level.
+    /// episode under the merge policy. `0` disables the seq window.
     max_gap: u64,
+    /// Maximum wall-clock gap (ns) between two events to be considered
+    /// the same episode. `0` disables the time window.
+    max_time_gap_ns: u64,
 }
 
 impl ChaosClusterer {
+    /// Backwards-compatible constructor: seq window only, time window
+    /// disabled. Equivalent to the pre-dual-window behaviour.
     pub fn new(max_gap: u64) -> Self {
-        Self { max_gap }
+        Self { max_gap, max_time_gap_ns: 0 }
+    }
+
+    /// Dual-window constructor. Either window can be disabled by
+    /// passing `0`; with both `0` no two events ever merge.
+    pub fn with_windows(max_gap: u64, max_time_gap_ns: u64) -> Self {
+        Self { max_gap, max_time_gap_ns }
     }
 
     /// Cluster events into semantic episodes.
@@ -80,8 +104,12 @@ impl ChaosClusterer {
 
     /// Merge decision — see module-level policy table.
     fn should_merge(&self, current: &ChaosCluster, event: &ChaosEvent) -> bool {
-        let seq_close = event.start_seq <= current.end_seq + self.max_gap;
-        if !seq_close {
+        let seq_close = self.max_gap > 0
+            && event.start_seq <= current.end_seq.saturating_add(self.max_gap);
+        let time_close = self.max_time_gap_ns > 0
+            && event.start_ts_ns
+                <= current.end_ts_ns.saturating_add(self.max_time_gap_ns);
+        if !(seq_close || time_close) {
             return false;
         }
         match (current.dominant_kind, event.kind) {
@@ -122,6 +150,8 @@ impl ChaosClusterer {
 pub struct ChaosCluster {
     pub start_seq: SeqNum,
     pub end_seq: SeqNum,
+    pub start_ts_ns: u64,
+    pub end_ts_ns: u64,
     pub events: Vec<ChaosEvent>,
     pub peak_severity: f64,
     pub mean_severity: f64,
@@ -144,6 +174,8 @@ impl ChaosCluster {
         let mut c = Self {
             start_seq: e.start_seq,
             end_seq: e.end_seq,
+            start_ts_ns: e.start_ts_ns,
+            end_ts_ns: e.end_ts_ns,
             peak_severity: e.severity,
             mean_severity: e.severity,
             composite_severity: 0.0,
@@ -159,6 +191,7 @@ impl ChaosCluster {
 
     fn absorb(&mut self, e: &ChaosEvent) {
         self.end_seq = self.end_seq.max(e.end_seq);
+        self.end_ts_ns = self.end_ts_ns.max(e.end_ts_ns);
         self.peak_severity = self.peak_severity.max(e.severity);
         self.sum_severity += e.severity;
         self.count += 1;
@@ -183,10 +216,24 @@ mod tests {
     use crate::ChaosFeatures;
 
     fn ev(kind: ChaosKind, start: u64, end: u64, sev: f64, initiator: Option<u64>) -> ChaosEvent {
+        ev_at(kind, start, end, 0, 0, sev, initiator)
+    }
+
+    fn ev_at(
+        kind: ChaosKind,
+        start_seq: u64,
+        end_seq: u64,
+        start_ts: u64,
+        end_ts: u64,
+        sev: f64,
+        initiator: Option<u64>,
+    ) -> ChaosEvent {
         ChaosEvent {
             kind,
-            start_seq: start,
-            end_seq: end,
+            start_seq,
+            end_seq,
+            start_ts_ns: start_ts,
+            end_ts_ns: end_ts,
             severity: sev,
             initiator,
             features: ChaosFeatures {
@@ -315,5 +362,43 @@ mod tests {
         );
         // Mean drops as the long episode adds 0.4 events to a 0.6 peak.
         assert!(l.mean_severity < s.mean_severity);
+    }
+
+    #[test]
+    fn time_window_merges_when_seq_window_would_split() {
+        // seq window is tight (10) but events sit far apart in seq
+        // (gap = 200) yet close in wall-clock (gap = 1ms while
+        // max_time_gap_ns = 5ms). Time window must rescue the merge.
+        let c = ChaosClusterer::with_windows(10, 5_000_000);
+        let evs = vec![
+            ev_at(ChaosKind::PhantomLiquidity, 10, 20, 1_000_000, 2_000_000, 0.5, Some(42)),
+            ev_at(ChaosKind::PhantomLiquidity, 220, 230, 3_000_000, 4_000_000, 0.7, Some(42)),
+        ];
+        let out = c.cluster(&evs);
+        assert_eq!(out.len(), 1, "time window should keep the episode together");
+        assert_eq!(out[0].count, 2);
+    }
+
+    #[test]
+    fn seq_window_merges_when_time_window_would_split() {
+        // Mirror case: wall-clock gap is huge (1s) but seq gap is tight
+        // (5 < max_gap = 100). Seq window must rescue the merge.
+        let c = ChaosClusterer::with_windows(100, 1_000);
+        let evs = vec![
+            ev_at(ChaosKind::Spoof, 10, 20, 1_000_000, 2_000_000, 0.5, Some(7)),
+            ev_at(ChaosKind::Spoof, 25, 30, 1_000_000_000, 1_000_000_500, 0.7, Some(7)),
+        ];
+        let out = c.cluster(&evs);
+        assert_eq!(out.len(), 1, "seq window should keep the episode together");
+    }
+
+    #[test]
+    fn both_windows_disabled_never_merges() {
+        let c = ChaosClusterer::with_windows(0, 0);
+        let evs = vec![
+            ev_at(ChaosKind::Spoof, 10, 20, 1_000, 2_000, 0.5, Some(1)),
+            ev_at(ChaosKind::Spoof, 11, 12, 2_000, 3_000, 0.5, Some(1)),
+        ];
+        assert_eq!(c.cluster(&evs).len(), 2);
     }
 }

@@ -333,6 +333,8 @@ impl FlashCrashDetector {
             kind: ChaosKind::FlashCrash,
             start_seq: snap.seq,
             end_seq: seq_event.seq,
+            start_ts_ns: snap.ts,
+            end_ts_ns: event.ts,
             severity,
             initiator: None,
             features: ChaosFeatures {

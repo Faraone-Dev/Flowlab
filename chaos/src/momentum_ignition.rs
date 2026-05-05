@@ -258,6 +258,8 @@ impl MomentumIgnitionDetector {
             kind: ChaosKind::MomentumIgnition,
             start_seq: self.run_start_seq,
             end_seq: seq_event.seq,
+            start_ts_ns: self.run_start_ts,
+            end_ts_ns: event.ts,
             severity,
             initiator: None,
             features: ChaosFeatures {

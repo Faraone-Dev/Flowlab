@@ -304,6 +304,8 @@ impl LatencyArbProxyDetector {
             kind: ChaosKind::LatencyArbitrage,
             start_seq: trig.seq,
             end_seq,
+            start_ts_ns: trig.ts,
+            end_ts_ns: end_ts,
             severity,
             initiator: None,
             features: ChaosFeatures {

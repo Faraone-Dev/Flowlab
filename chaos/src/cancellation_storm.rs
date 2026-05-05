@@ -287,6 +287,8 @@ impl CancellationStormDetector {
             kind: ChaosKind::CancellationStorm,
             start_seq: self.burst_start_seq,
             end_seq,
+            start_ts_ns: self.burst_start_ts,
+            end_ts_ns: end_ts,
             severity,
             initiator: None,
             features: ChaosFeatures {

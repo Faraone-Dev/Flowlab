@@ -48,6 +48,14 @@ pub struct ChaosEvent {
     pub kind: ChaosKind,
     pub start_seq: SeqNum,
     pub end_seq: SeqNum,
+    /// Wall-clock ns of the first event composing this flag. Used by
+    /// downstream clusterers running a dual seq+time window. Detectors
+    /// that have no per-event timestamp source (rate-window detectors)
+    /// MAY set this to the ts of the burst-window head.
+    pub start_ts_ns: u64,
+    /// Wall-clock ns of the triggering event. Same convention as
+    /// `start_ts_ns`.
+    pub end_ts_ns: u64,
     /// Normalized severity score [0.0, 1.0]
     pub severity: f64,
     /// Order ID that initiated the pattern (if identifiable)
