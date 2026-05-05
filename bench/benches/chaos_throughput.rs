@@ -11,6 +11,7 @@
 //!
 //! Structure:
 //!   * `chain_full`        — all 5 detectors via `ChaosChain::default_itch`
+//!   * `chain_full_into`   — same chain, `process_into` with reused buffer
 //!   * `baseline_no_chain` — same loop, no detection (lower bound)
 //!   * `per_detector/*`    — each detector standalone, for breakdown
 //!
@@ -54,6 +55,34 @@ fn bench_chain_full(c: &mut Criterion) {
                 for ev in stream {
                     let flags = chain.process(black_box(ev));
                     black_box(&flags);
+                }
+                black_box(chain.total_flags());
+            });
+        });
+    }
+    group.finish();
+}
+
+// ─── Group 1b — full chain, zero-alloc API ─────────────────────────
+//
+// Identical to `chain_full` except the per-event Vec is hoisted out
+// of the inner loop and reused via `process_into`. The Criterion delta
+// between the two groups is the per-event allocator cost the chain
+// pays when its caller doesn't own the buffer.
+
+fn bench_chain_full_into(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chaos/chain_full_into");
+    for &n in STREAM_SIZES {
+        let stream = make_stream(n);
+        group.throughput(Throughput::Elements(stream.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &stream, |b, stream| {
+            b.iter(|| {
+                let mut chain = ChaosChain::default_itch();
+                let mut buf: Vec<flowlab_chaos::ChaosEvent> = Vec::with_capacity(8);
+                for ev in stream {
+                    buf.clear();
+                    chain.process_into(black_box(ev), &mut buf);
+                    black_box(&buf);
                 }
                 black_box(chain.total_flags());
             });
@@ -150,6 +179,7 @@ fn bench_per_detector(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_chain_full,
+    bench_chain_full_into,
     bench_baseline_no_chain,
     bench_per_detector
 );
