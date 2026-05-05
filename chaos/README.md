@@ -60,6 +60,31 @@ event triggers more than one detector — useful for diff-able reports.
 `ChaosChain::default_itch()` builds a chain with the calibration
 table below.
 
+## Hot-path API: `process` vs `process_into`
+
+`ChaosChain` exposes two shapes of the same call:
+
+* `process(seq_event) -> Vec<ChaosEvent>` — ergonomic, allocates a fresh
+  `Vec` per event. Fine for tests, REPLs, one-shot diagnostics.
+* `process_into(seq_event, &mut Vec<ChaosEvent>)` — **the hot-path
+  contract**. Caller owns the buffer; in a tight loop the recommended
+  pattern is to allocate one `Vec::with_capacity(8)` outside the loop
+  and `out.clear()` per event so the chain runs at zero heap traffic
+  even at millions of events per second.
+
+Both APIs share the same body — `process` is a thin wrapper around
+`process_into`. The kind sequence and per-kind counters (`count(kind)`,
+`total_flags()`) are byte-identical between the two paths; this is
+pinned by the `process_into_matches_process` test in
+`chaos/src/chain.rs` and by the `chain_full_into` Criterion group in
+`bench/benches/chaos_throughput.rs`.
+
+What this is **not**: a claim that the chain is allocation-free in
+absolute terms. Detector internals still own bounded structures
+(mini-books, ring buffers, Welford state); `process_into` only removes
+the per-event output allocation, which is the one the *caller* pays
+on every event regardless of whether anything fired.
+
 ## Calibration table — `default_itch()`
 
 Tuned for raw ITCH 5.0 streams (US equities, ~100 µs cadence,
