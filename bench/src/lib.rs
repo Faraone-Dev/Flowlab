@@ -379,6 +379,66 @@ pub fn warmup_events(n: usize, cfg: &MarketConfig) -> Vec<SequencedEvent> {
 mod tests {
     use super::*;
 
+    /// Cross-implementation L2 hash agreement gate (Rust native only).
+    ///
+    /// Replays 50 000 synthetic events through all three order-book
+    /// implementations and asserts byte-for-byte hash identity:
+    ///   - `HotOrderBook<256>` (flat array, slab-backed)
+    ///   - `OrderBook` (BTreeMap reference oracle)
+    ///   - `CppOrderBook` (C++20 flat array via FFI, requires `native`)
+    ///
+    /// Any mismatch here is a hard correctness failure — the replay
+    /// pipeline produces non-deterministic state. Fail-fast, no retry.
+    #[cfg(feature = "native")]
+    #[test]
+    fn cross_impl_l2_hash_agreement() {
+        use flowlab_core::event::EventType;
+        use flowlab_core::ffi::CppOrderBook;
+        use flowlab_core::hot_book::HotOrderBook;
+        use flowlab_core::orderbook::OrderBook;
+        use flowlab_replay::itch::parse_buffer;
+
+        let raw = flowlab_replay::itch::synthetic_itch_stream(50_000, 0xC0FFEE);
+        let mut parsed = Vec::with_capacity(50_000);
+        parse_buffer(&raw, &mut parsed).unwrap();
+
+        let mut hot = HotOrderBook::<256>::new(1);
+        let mut bt = OrderBook::new(1);
+        let mut cpp = CppOrderBook::new();
+
+        for ev in &parsed {
+            let t = ev.event_type;
+            if t == EventType::OrderAdd as u8
+                || t == EventType::OrderCancel as u8
+                || t == EventType::Trade as u8
+            {
+                hot.apply(ev);
+                bt.apply(ev);
+                cpp.apply(ev);
+            }
+        }
+
+        let h_hot = hot.canonical_l2_hash();
+        let h_bt = bt.canonical_l2_hash();
+        let h_cpp = cpp.state_hash();
+
+        assert_eq!(
+            h_hot, h_bt,
+            "HotOrderBook / OrderBook (BTreeMap) mismatch: hot={:#018x} bt={:#018x}",
+            h_hot, h_bt
+        );
+        assert_eq!(
+            h_hot, h_cpp,
+            "Rust / C++ L2 hash mismatch: rust={:#018x} cpp={:#018x}",
+            h_hot, h_cpp
+        );
+
+        eprintln!(
+            "  cross-impl L2 hash gate: rust={:#018x} cpp={:#018x} PASS",
+            h_hot, h_cpp
+        );
+    }
+
     #[test]
     fn generator_is_deterministic() {
         let cfg = MarketConfig::default();

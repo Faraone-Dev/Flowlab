@@ -60,8 +60,8 @@ jobs:
         run: zig build test --summary all
       - name: Build Rust + native FFI
         run: cargo build -p flowlab-core --features native
-      - name: Run native-gated benches (compile only, --no-run)
-        run: cargo bench -p flowlab-bench --bench pipeline --features native --no-run
+      - name: Cross-language L2 hash agreement gate
+        run: cargo test -p flowlab-bench --features native -- cross_impl_l2_hash_agreement
 
   # ─── Go workspace (ingest). ────────────────────────────────────────
   go:
