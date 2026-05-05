@@ -16,7 +16,7 @@ origin.
 | `wal.rs`         | Implemented — segmented 64 MiB WAL with CRC-32, torn-tail recovery, bit-exact replay |
 | `moldudp.rs`     | Implemented — MoldUDP64 frame parser + `GapTracker` (bounded forward buffer) |
 | `udp_source.rs`  | Implemented — UDP multicast ingress bound to MoldUDP64            |
-| `snapshot.rs`    | **WIP** — `Snapshot` struct only; serialize/deserialize is a TODO |
+| `snapshot.rs`    | Implemented — binary `FLSN` format, versioned, little-endian, hand-rolled |
 
 ## Modules
 
@@ -30,7 +30,7 @@ origin.
 | `wal.rs`         | Segmented 64 MiB WAL with CRC-32, torn-tail recovery, bit-exact   |
 | `moldudp.rs`     | MoldUDP64 frame parser + `GapTracker` (bounded forward buffer)    |
 | `udp_source.rs`  | UDP multicast ingress bound to MoldUDP64                          |
-| `snapshot.rs`    | Snapshot data type — persistence layer not yet implemented        |
+| `snapshot.rs`    | Snapshot codec: `FLSN` magic + version + LE wire layout, typed errors |
 
 ## Ring buffer layout (mmap, shared with Go `ingest/mmap/ring.go`)
 

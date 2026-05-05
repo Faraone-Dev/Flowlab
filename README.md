@@ -781,17 +781,20 @@ banners.
   injection, multi-thread burst desync
 - C++ `OrderBook<MaxLevels>` (flat-array L2) and Welford
   `RollingStats` header, callable through the FFI
+- Snapshot binary format: `FLSN` magic, versioned, little-endian
+  layout, hand-rolled (no schema crate dep)
+- Windows mmap ring writer via `CreateFileMapping` + `MapViewOfFile`,
+  byte-identical to the POSIX layout
 
-**WIP — not production-grade today:**
+**Partial — landed but not yet at full scope:**
 
-| Item | Status | Reference |
-| ---- | ------ | --------- |
-| C++ SIMD batch stats | Header-only `RollingStats` is real; SIMD batch update is a TODO | [hotpath/src/stats.cpp](hotpath/src/stats.cpp) |
-| Snapshot serialize/deserialize | Struct only; no on-disk format yet | [replay/src/snapshot.rs](replay/src/snapshot.rs) |
-| Lab matching engine | Removed in favor of integrating live external bots through the `/bot/state` adapter; see Adversarial Desk below | [api/server/bot_proxy.go](api/server/bot_proxy.go) |
-| Chaos pattern detectors (passive) | All 5 storm kinds have **active injectors** (`api/server/feed.go`); the **passive detector** counterparts (`PhantomLiquidityDetector`, `CancellationStormDetector`, `MomentumIgnitionDetector`, `FlashCrashDetector`, `LatencyArbProxyDetector`) classify their own injected output and the legacy `QuoteStuff`/`Spoof` paths, but are not yet wired into the engine pipeline | [chaos/src/chain.rs](chaos/src/chain.rs) |
-| Windows mmap ring writer | Linux/macOS/FreeBSD only; Windows path returns an explicit error and recommends WSL | [ingest/mmap/ring_windows.go](ingest/mmap/ring_windows.go) |
-| Control API | `/health` and `/status` only; `/metrics` and `/ingest/*` are TODO | [api/server/server.go](api/server/server.go) |
+| Item | What's done / what's missing | Reference |
+| ---- | ---------------------------- | --------- |
+| C++ SIMD batch stats | Header-only `RollingStats` (Welford, `O(1)`) is real and used in the FFI; AVX2 batch update is a placeholder | [hotpath/src/stats.cpp](hotpath/src/stats.cpp) |
+| Chaos passive detectors | All 5 detectors implemented + 41 unit tests green; `ChaosChain` runs in benches (`chaos_throughput`, `chaos_latency`) but is **not yet cabled into the engine runtime** — passive classification of live storms is the next wire-up | [chaos/src/chain.rs](chaos/src/chain.rs) |
+| CI cross-impl hash gate | `bench_cpp_agreement` asserts byte-for-byte digest equality between Rust and C++ in [bench/benches/pipeline.rs](bench/benches/pipeline.rs); CI currently builds the bench (`--no-run`) but does not execute the assertion. The gate exists in code but is not enforced on every push yet | [.github/workflows/ci.yml](.github/workflows/ci.yml) |
+| Lab matching engine | Removed deliberately in favor of adapting external trading bots through the `/bot/state` adapter; see Adversarial Desk above | [api/server/bot_proxy.go](api/server/bot_proxy.go) |
+| Control API | `/health`, `/status`, `/stream`, `/storm/*`, `/run/*`, `/bot/*` implemented; `/metrics` (Prometheus) and `/ingest/*` are not yet wired | [api/server/server.go](api/server/server.go) |
 
 ## 🚫 Out of scope
 
