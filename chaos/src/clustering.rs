@@ -103,14 +103,30 @@ impl ChaosClusterer {
 
 /// A semantic episode built from one or more [`ChaosEvent`]s.
 ///
-/// `peak_severity` is preserved for backwards compatibility with existing
-/// consumers; richer aggregates land in the severity-composita commit.
+/// Three severity scalars are exposed because each one answers a
+/// different question and they are not interchangeable:
+///
+/// * `peak_severity` — the worst single flag in the episode. Useful for
+///   triage ("how bad did it get at the worst instant?").
+/// * `mean_severity` — average per-event severity. Useful when the
+///   episode is long and you want to know if it stayed bad or just
+///   spiked once.
+/// * `composite_severity` — `peak * (1 + ln(count))`. Combines worst
+///   instant with persistence so a long sustained episode ranks above a
+///   single isolated spike of the same peak. This is the field the
+///   dashboard should sort by when ranking episodes.
+///
+/// `peak_severity` is the only one preserved from the previous schema;
+/// the other two are additive and don't break existing consumers.
 #[derive(Debug, Clone)]
 pub struct ChaosCluster {
     pub start_seq: SeqNum,
     pub end_seq: SeqNum,
     pub events: Vec<ChaosEvent>,
     pub peak_severity: f64,
+    pub mean_severity: f64,
+    pub composite_severity: f64,
+    pub count: usize,
     /// Kind of the *first* event in the cluster — used by the merge
     /// policy to decide if a follow-up event is a continuation of the
     /// same episode or the start of a new one.
@@ -118,24 +134,46 @@ pub struct ChaosCluster {
     /// Initiator carried over from the first event; used by the merge
     /// policy. `None` means "unknown actor" (not "anonymous shared").
     pub initiator: Option<u64>,
+    /// Running sum of per-event severities; used to incrementally
+    /// recompute `mean_severity` as events are absorbed.
+    sum_severity: f64,
 }
 
 impl ChaosCluster {
     fn from_event(e: &ChaosEvent) -> Self {
-        Self {
+        let mut c = Self {
             start_seq: e.start_seq,
             end_seq: e.end_seq,
             peak_severity: e.severity,
+            mean_severity: e.severity,
+            composite_severity: 0.0,
+            count: 1,
             dominant_kind: e.kind,
             initiator: e.initiator,
+            sum_severity: e.severity,
             events: vec![e.clone()],
-        }
+        };
+        c.recompute_composite();
+        c
     }
 
     fn absorb(&mut self, e: &ChaosEvent) {
         self.end_seq = self.end_seq.max(e.end_seq);
         self.peak_severity = self.peak_severity.max(e.severity);
+        self.sum_severity += e.severity;
+        self.count += 1;
+        self.mean_severity = self.sum_severity / self.count as f64;
         self.events.push(e.clone());
+        self.recompute_composite();
+    }
+
+    /// `peak * (1 + ln(count))`. `ln(1) == 0` so a 1-event cluster has
+    /// composite == peak, matching intuition. Growth is sub-linear in
+    /// count so a 100-event cluster does not dominate a 5-event one
+    /// purely on volume.
+    fn recompute_composite(&mut self) {
+        let persistence = 1.0 + (self.count as f64).ln();
+        self.composite_severity = self.peak_severity * persistence;
     }
 }
 
@@ -236,5 +274,46 @@ mod tests {
     fn empty_input_yields_no_clusters() {
         let c = ChaosClusterer::new(100);
         assert!(c.cluster(&[]).is_empty());
+    }
+
+    #[test]
+    fn singleton_composite_equals_peak() {
+        // 1 event -> ln(1) == 0 -> composite == peak. Pinning this so a
+        // future tweak of the persistence factor cannot silently change
+        // the meaning of the field for the common 1-event case.
+        let c = ChaosClusterer::new(100);
+        let evs = vec![ev(ChaosKind::Spoof, 10, 20, 0.8, Some(1))];
+        let out = c.cluster(&evs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].count, 1);
+        assert!((out[0].composite_severity - 0.8).abs() < 1e-9);
+        assert!((out[0].mean_severity - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn composite_grows_with_persistence_not_volume() {
+        // Two episodes with the SAME peak (0.6); the longer one must
+        // rank strictly higher on composite.
+        let c = ChaosClusterer::new(100);
+        let short = vec![
+            ev(ChaosKind::PhantomLiquidity, 10, 20, 0.6, Some(1)),
+            ev(ChaosKind::PhantomLiquidity, 30, 40, 0.4, Some(1)),
+        ];
+        let long = vec![
+            ev(ChaosKind::PhantomLiquidity, 10, 20, 0.6, Some(1)),
+            ev(ChaosKind::PhantomLiquidity, 30, 40, 0.4, Some(1)),
+            ev(ChaosKind::PhantomLiquidity, 50, 60, 0.4, Some(1)),
+            ev(ChaosKind::PhantomLiquidity, 70, 80, 0.4, Some(1)),
+            ev(ChaosKind::PhantomLiquidity, 90, 100, 0.4, Some(1)),
+        ];
+        let s = &c.cluster(&short)[0];
+        let l = &c.cluster(&long)[0];
+        assert_eq!(s.peak_severity, l.peak_severity);
+        assert!(
+            l.composite_severity > s.composite_severity,
+            "longer episode at same peak must rank higher"
+        );
+        // Mean drops as the long episode adds 0.4 events to a 0.6 peak.
+        assert!(l.mean_severity < s.mean_severity);
     }
 }
