@@ -20,11 +20,11 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(version, about = "flowlab realtime engine", long_about = None)]
 struct Cli {
-    /// Source kind: synthetic | ich | binance
+    /// Source kind: synthetic | ich
     #[arg(long, default_value = "synthetic")]
     source: String,
 
-    /// Source argument: file path for ich, symbol for binance, ignored for synthetic.
+    /// Source argument: file path for ich, ignored for synthetic.
     #[arg(long, default_value = "")]
     source_arg: String,
 
@@ -157,8 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Box::new(s)
         }
-        "binance" => unimplemented!("BinanceSource lands in the step after ich"),
-        other => return Err(format!("unknown source: {other}").into()),
+        other => return Err(format!("unknown source: {other} (supported: synthetic, ich)").into()),
     };
 
     // Bounded channel — see backpressure.rs.
