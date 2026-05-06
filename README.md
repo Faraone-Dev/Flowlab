@@ -93,10 +93,15 @@ Rust. The other languages are scoped specializations.
 
 | Concern        | Language | Scope                                              | LOC     |
 | -------------- | -------- | -------------------------------------------------- | ------- |
-| Truth          | Rust     | Event ABI, state machine, replay, WAL, analytics   | ~14,600 |
-| Specialization | Zig 0.13 | `comptime` ITCH 5.0 parser, zero-copy              | ~480    |
-| Speed (opt-in) | C++20    | L2 book + Welford stats behind `--features native` | ~500    |
-| I/O + control  | Go       | mmap ring writer, WS ingest, control plane + CHAOS | ~2,200  |
+| Truth          | Rust     | Event ABI, state machine, replay, WAL, analytics   | ~16,200 |
+| Specialization | Zig 0.13 | `comptime` ITCH 5.0 parser, zero-copy              | ~490    |
+| Speed (opt-in) | C++20    | L2 book + Welford stats behind `--features native` | ~530    |
+| I/O + control  | Go       | mmap ring writer, WS ingest, control plane + CHAOS | ~2,800  |
+| UI             | TS/TSX   | React + Vite + uPlot CHAOS desk (`dashboard/`)     | ~1,200  |
+
+C++ count is hand-written code only; the vendored single-header
+`hotpath/include/xxhash.h` (~6.6 kLOC, XXH3 reference impl v0.8.3)
+is excluded.
 
 Go **never** participates in replay. C++ and Zig never touch the
 network. The deterministic core has no runtime dependency on either
