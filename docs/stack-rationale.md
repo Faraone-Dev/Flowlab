@@ -204,24 +204,16 @@ promise is reproducibility under stress, this is the right trade.
 
 ---
 
-## Reference points
+## The general pattern
 
-For context, multi-language stacks are the norm — not the exception —
-in the firms whose engineering style this repo aims at:
-
-- Optiver: C++ + Python (research) + occasional Rust
-- Jane Street: OCaml + C + Python
-- IMC Trading: Java + C++ + Python
-- Hudson River Trading: C++ + Python + Java
-- Jump Trading: C++ + Python + Java + KDB
-- Citadel Securities: C++ + Python + KDB
-
-In every case the rule is the same: the *deterministic execution
-core* is in the language with the strongest static guarantees and the
-weakest hidden runtime; *I/O, research, and tooling* live in
-languages chosen for ergonomics. Flowlab follows the same pattern at
-hobby scale: Rust for the core, Zig/C++ for specialised hot kernels,
-Go for I/O and control, TS for the UI.
+Multi-language stacks are the norm in any system where the
+deterministic execution core has different constraints from the
+control plane. The rule is consistent: the *deterministic core* is
+in the language with the strongest static guarantees and the weakest
+hidden runtime; *I/O, research, and tooling* live in languages chosen
+for ergonomics. Flowlab follows the same pattern: Rust for the core,
+Zig/C++ for specialised hot kernels, Go for I/O and control, TS for
+the UI.
 
 ---
 
