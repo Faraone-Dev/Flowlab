@@ -3,12 +3,15 @@
 **Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
 Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go control plane &nbsp;|&nbsp;
-150 tests (128 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
+155 tests (133 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
 MoldUDP64 + WAL + SPSC mmap ring &nbsp;|&nbsp; Rust↔Zig↔C++ canonical L2 hash bit-identical &nbsp;|&nbsp;
 6-guard fail-closed risk gate &nbsp;|&nbsp;
 React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
 recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 [`dashboard/`](dashboard/), [`api/`](api/) and [`engine/`](engine/).
+
+![FLOWLAB CHAOS desk — synthetic feed live, EVT/S 121k, p50 44 ns, p99 166 ns, ZEUS-HFT target panel](docs/dashboard.png)
+<sub>Single-origin desk: Rust engine on `:9090` → Go bridge on `:8080` → React/uPlot dashboard. Left rail = CHAOS DECK + SCOREBOARD + TARGET (ZEUS-HFT). Bottom-right = pipeline stage latency (parse / apply / analytics / risk / wire) p50 + p99.</sub>
 
 > [!IMPORTANT]
 > 📄 **Latency documents:**
@@ -21,7 +24,8 @@ recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 | --- | --- |
 | `HotOrderBook::apply` TOTAL p50 (5/5 cross-CPU) | **22 ns** |
 | Cross-impl L2 hash agreement (Rust ↔ Zig ↔ C++) | `0xf54ce1b763823e87` |
-| Tests | **150** (128 Rust + 12 Zig + 10 Go) |
+| Snapshot resume | replay-from-checkpoint **≡** replay-from-scratch (e2e proven) |
+| Tests | **155** (133 Rust + 12 Zig + 10 Go) |
 | Canonical `Event` ABI | **40 B**, frozen, `#[repr(C)]` |
 | Risk gate guards | **6**, fail-closed, latching |
 | Live storm injectors | **5** (Phantom · Cancel · Ignition · Crash · Lat-Arb) |
@@ -636,7 +640,7 @@ cd ingest      && go test -race -count=1 ./...      # Go
 ```
 
 Passing counts (verified by `cargo test --workspace` + `zig build
-test` + `go test ./...`): **150 total** = 128 Rust + 12 Zig + 10 Go.
+test` + `go test ./...`): **155 total** = 133 Rust + 12 Zig + 10 Go.
 Breakdown:
 
 | Surface                                       | Tests   |
