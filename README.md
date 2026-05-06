@@ -21,6 +21,7 @@ recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 > 📐 **Design documents:**
 > - 🎯 [`docs/feed-design.md`](docs/feed-design.md) — why **ITCH replay alone is not enough for chaos**, why the synthetic feed lives in Go, storm parameter discipline, rejected alternatives
 > - 🧱 [`docs/stack-rationale.md`](docs/stack-rationale.md) — **why 4 + 1 languages**, what each layer is forbidden from doing, FFI contract, cost of the multi-language stack (honest)
+> - 🔀 [`docs/reference-vs-hot.md`](docs/reference-vs-hot.md) — **three independent order book implementations** (BTreeMap oracle + array/slab hot path + C++ template), one canonical L2 hash, gated in CI fail-fast
 
 ### TL;DR
 
