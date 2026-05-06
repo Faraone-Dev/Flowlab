@@ -33,4 +33,18 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run feed parser tests");
     test_step.dependOn(&run_tests.step);
+
+    // Dedicated fuzz step — same compile unit as `test` (fuzz tests are
+    // imported by `main.zig`) but exposed as a separate target so CI
+    // can gate on it explicitly. Forces ReleaseFast so 200k+ iterations
+    // per property complete in well under a second.
+    const fuzz_tests = b.addTest(.{
+        .root_source_file = b.path("src/fuzz.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .filter = "fuzz",
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run ITCH parser fuzz harness (property-based, seeded)");
+    fuzz_step.dependOn(&run_fuzz.step);
 }

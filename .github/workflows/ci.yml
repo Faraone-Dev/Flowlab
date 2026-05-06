@@ -58,6 +58,9 @@ jobs:
       - name: Zig unit tests
         working-directory: feed-parser
         run: zig build test --summary all
+      - name: Zig parser fuzz harness (property-based, seeded)
+        working-directory: feed-parser
+        run: zig build fuzz
       - name: Build Rust + native FFI
         run: cargo build -p flowlab-core --features native
       - name: Cross-language L2 hash agreement gate

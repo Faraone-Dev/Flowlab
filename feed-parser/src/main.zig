@@ -36,3 +36,10 @@ export fn flowlab_event_size() callconv(.C) usize {
 test "event size is 40 bytes" {
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(event.Event));
 }
+
+// Pull in fuzz tests so `zig build test` runs them too. A dedicated
+// `zig build fuzz` step exists for CI gating; the import here ensures
+// the fuzz tests cannot rot silently.
+test {
+    _ = @import("fuzz.zig");
+}

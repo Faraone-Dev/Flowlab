@@ -3,7 +3,7 @@
 **Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
 Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go control plane &nbsp;|&nbsp;
-185 tests (163 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
+193 tests (163 Rust + 20 Zig + 10 Go, incl. seeded ITCH parser fuzz harness) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
 MoldUDP64 + WAL + SPSC mmap ring &nbsp;|&nbsp; Rust↔Zig↔C++ canonical L2 hash bit-identical &nbsp;|&nbsp;
 6-guard fail-closed risk gate &nbsp;|&nbsp;
 React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
@@ -29,7 +29,7 @@ recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 | `HotOrderBook::apply` TOTAL p50 (5/5 cross-CPU) | **22 ns** |
 | Cross-impl L2 hash agreement (Rust ↔ Zig ↔ C++) | `0xf54ce1b763823e87` |
 | Snapshot resume | replay-from-checkpoint **≡** replay-from-scratch (e2e proven) |
-| Tests | **185** (163 Rust + 12 Zig + 10 Go) |
+| Tests | **193** (163 Rust + 20 Zig + 10 Go, incl. seeded ITCH parser fuzz harness — 4 invariants × 200k–1M iters) |
 | Canonical `Event` ABI | **40 B**, frozen, `#[repr(C)]` |
 | Risk gate guards | **6**, fail-closed, latching |
 | Live storm injectors | **5** (Phantom · Cancel · Ignition · Crash · Lat-Arb) |
@@ -647,8 +647,10 @@ cd ingest      && go test -race -count=1 ./...      # Go
 ```
 
 Passing counts (verified by `cargo test --workspace --features native`
-+ `zig build test` + `go test ./...`): **185 total** = 163 Rust + 12 Zig
-+ 10 Go. Breakdown:
++ `zig build test` + `go test ./...`): **193 total** = 163 Rust + 20 Zig
++ 10 Go. The Zig count includes the seeded ITCH parser fuzz harness
+(`feed-parser/src/fuzz.zig`, also gated separately in CI via
+`zig build fuzz`). Breakdown:
 
 | Surface                                                            | Tests       |
 | ------------------------------------------------------------------ | ----------- |
