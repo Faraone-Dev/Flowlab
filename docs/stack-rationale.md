@@ -199,8 +199,8 @@ The split is not free.
 The trade was explicit: pay one-time stack complexity to gain (a) the
 right tool per layer, (b) provable cross-language determinism, (c) no
 runtime dependency on a GC inside the deterministic core. For a
-research and simulation framework whose core promise is determinism,
-this is the right trade.
+deterministic substrate that hosts live trading bots and whose core
+promise is reproducibility under stress, this is the right trade.
 
 ---
 

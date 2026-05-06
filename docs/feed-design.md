@@ -177,14 +177,15 @@ place: the canonical Event.
 
 ## Limits we do not hide
 
-- The synthetic feed is **not a market simulator**. It does not model
-  market impact, queue position, fill probability, or counterparty
-  behaviour. It only reshapes the *observable* microstructure (depth,
-  trade velocity, mid path, latency tail).
+- The synthetic feed reshapes the *observable* microstructure (depth,
+  trade velocity, mid path, latency tail). It does not by itself model
+  internal matching, queue position, or fill probability — those live
+  in the connected bot's execution path against its real venue.
 - ITCH replay is single-symbol per run by default. Multi-symbol
   replay works but is not part of the day-to-day stress harness.
 - The synthetic feed targets `--tick-hz 50` for stable measurement;
   cranking it up changes the cadence-vs-cardinality tradeoff and
   invalidates comparison against any number recorded at 50 Hz.
-- Neither source is a substitute for venue connectivity. Live trading
-  is explicitly out of scope (see README "What is real, what is WIP").
+- Neither source is a substitute for venue connectivity inside the
+  Flowlab core. Connected bots (TARGET endpoint) own that layer; the
+  ZEUS-HFT integration in the dashboard is the reference example.

@@ -40,21 +40,28 @@ controlled storm conditions. Same input bytes produce identical state,
 byte-for-byte, across runs and platforms.
 
 > [!WARNING]
-> **Research and simulation framework. Not a trading system.**
+> **Deterministic substrate + adversarial harness for live trading bots.**
 >
 > **Modeled:** deterministic order flow replay, microstructure analytics,
-> chaos pattern detection, live adversarial storms against a third-party
-> trading bot (TARGET), audit-grade run recording.
+> chaos pattern detection, live adversarial storms against a connected
+> trading bot (TARGET endpoint), real-time bot PnL telemetry, audit-grade
+> run recording.
 >
-> **Not modeled:** market impact, queue position, fill probability,
-> exchange matching, latency arbitrage outcomes, real PnL.
+> **Not modeled inside Flowlab:** internal matching engine, queue
+> position, fill probability. Connected bots own venue connectivity and
+> their own execution path (ZEUS-HFT runs as a TARGET against this
+> harness in production); Flowlab is the substrate they plug into, not a
+> replacement for them.
 
 ---
 
 ## 🧭 Positioning
 
 **flowlab is the deterministic data + analytics substrate an HFT
-research stack sits on top of — it is not the full trading stack.**
+research and execution stack sits on top of.** Real trading bots
+(ZEUS-HFT today) connect as TARGET, receive the live event stream,
+run their own decision + venue routing, and stream back PnL telemetry
+that Flowlab records, stresses, and replays.
 
 Four languages, one source of truth: Rust owns the state machine, Zig
 owns the parser, C++ owns the hot kernels, Go owns I/O. The
@@ -821,15 +828,20 @@ banners.
 | Lab matching engine | Removed deliberately in favor of adapting external trading bots through the `/bot/state` adapter; see Adversarial Desk above | [api/server/bot_proxy.go](api/server/bot_proxy.go) |
 | Control API | `/health`, `/status`, `/stream`, `/storm/*`, `/run/*`, `/bot/*` implemented; `/metrics` (Prometheus) and `/ingest/*` are not yet wired | [api/server/server.go](api/server/server.go) |
 
-## 🚫 Out of scope
+## 🚫 Out of perimeter (by design, not by limitation)
 
-- Live trading
-- Production exchange connectivity
-- Real-time risk or position management
-- Arbitrage or mempool tooling
+These live in the **connected bot**, not in the Flowlab core:
 
-FLOWLAB is a research and simulation framework. All execution paths
-operate on replayed data.
+- Internal matching engine (deliberately removed in favour of the
+  TARGET adapter — connected bots route to real venues themselves)
+- Direct exchange connectivity (owned by the bot; ZEUS-HFT runs
+  FIX 4.4 dual-connection against live venues as TARGET today)
+- Strategy logic and position sizing (owned by the bot)
+
+Flowlab provides the deterministic substrate, the adversarial
+harness, and the telemetry/recording layer. Live trading happens
+through connected bots; the screenshot in `docs/dashboard.png` shows
+ZEUS-HFT live with real EUR PnL streamed via `/bot/state`.
 
 ---
 
