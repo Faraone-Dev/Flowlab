@@ -1,211 +1,212 @@
-# Reference vs hot — three implementations, one canonical hash
+# Three order books, one number — how Flowlab knows the fast one is right
 
 > Status: **frozen 2026-05-06**
-> Scope: correctness strategy for the order book hot path
-> Reference: [bench/src/lib.rs](../bench/src/lib.rs) (test
-> `cross_impl_l2_hash_agreement`),
-> [core/src/orderbook.rs](../core/src/orderbook.rs),
-> [core/src/hot_book.rs](../core/src/hot_book.rs),
-> [core/src/ffi.rs](../core/src/ffi.rs)
+> Code: [bench/src/lib.rs](../bench/src/lib.rs) · test
+> `cross_impl_l2_hash_agreement`
+> Books: [core/src/orderbook.rs](../core/src/orderbook.rs) (slow) ·
+> [core/src/hot_book.rs](../core/src/hot_book.rs) (fast) ·
+> [core/src/ffi.rs](../core/src/ffi.rs) (C++ via FFI)
 
 ---
 
-## TL;DR
+## The short version
 
-Flowlab carries **three independent order book implementations**. They
-exist on purpose. Every push to `main` runs them on the same 50 000
-synthetic ITCH events (seed `0xC0FFEE`) and asserts they all produce
-the **same canonical L2 hash**. Any mismatch fails CI fail-fast, no
-retry.
+Flowlab carries **three order books**. They look different inside, but
+they must produce the **same number** when fed the same events. CI
+runs the comparison on every push. If the numbers diverge by one bit,
+the build fails.
 
-| # | Implementation        | Language | Layout                  | Role                                |
-| - | --------------------- | -------- | ----------------------- | ----------------------------------- |
-| 1 | `OrderBook`           | Rust     | `BTreeMap<Price, Level>` + `HashMap<OrderId, Order>` | reference oracle — boring, obvious |
-| 2 | `HotOrderBook<256>`   | Rust     | fixed-array bids/asks + slab + sparse index | production hot path |
-| 3 | `CppOrderBook`        | C++20    | template `OrderBook<MaxLevels>` (mirror of #2) | cross-language witness |
+| #  | Name                | Language | What it looks like inside        | Why it exists                |
+| -- | ------------------- | -------- | -------------------------------- | ---------------------------- |
+| 1  | `OrderBook`         | Rust     | sorted map (`BTreeMap`)          | the slow, obviously-correct one |
+| 2  | `HotOrderBook<256>` | Rust     | fixed arrays + slab + cache tricks | the fast one used in production |
+| 3  | `CppOrderBook`      | C++20    | template version of #2           | the cross-language check     |
 
-The interesting property is not "Flowlab has an order book". It is
-**"Flowlab has three, and the build refuses to compile if they
-disagree by one bit."**
+The three implementations never talk to each other. They each take the
+same events, build their own state, and at the end they each spit out
+one number — a hash of the book. **All three numbers must be equal.**
 
----
-
-## The problem an optimised hot path always has
-
-A naive in-process order book is easy to make correct: walk a sorted
-map, insert in order, sum quantities. Slow, but obviously right —
-the data structure does the ordering work for you.
-
-The hot path is the opposite. To hit nanosecond budgets it must be
-ugly:
-
-- bids/asks as **fixed `[Level; MAX_LEVELS]` arrays** (no `Vec`,
-  no heap) — see [core/src/hot_book.rs](../core/src/hot_book.rs)
-  lines 64–88.
-- `align(64)` struct with an explicit **`_gap: [u8; 64]`** between
-  bid and ask grids to prevent false sharing on SIMD loads
-  ([core/src/hot_book.rs](../core/src/hot_book.rs) lines 73–82).
-- order index split into a **dense `Vec<OrderMeta>` slab + sparse
-  `HashMap<u64, u32>`** (12 B/entry instead of 32 B → ~5× more
-  entries per cache line on lookup) —
-  [core/src/hot_book.rs](../core/src/hot_book.rs) lines 113–123.
-- `_mm_prefetch` one event ahead, hot/cold split on `trade()`,
-  `ptr::copy` instead of bubble swaps for insertion.
-
-Every one of those decisions is a knife. Each can silently produce
-the wrong state and you would not notice until a downstream invariant
-broke at 3 AM.
-
-The standard answer in HFT firms is: **keep a slow reference
-implementation alive forever, and validate the fast one against it on
-every build.** Jane Street validates OCaml against C, Optiver
-validates Python research against C++ tactical, HRT validates Python
-against C++. The reference is not legacy code waiting to be deleted —
-it is the oracle.
-
-Flowlab does the same thing.
+That's it. That's the whole idea.
 
 ---
 
-## How the gate works in this repo
+## Why even bother
 
-The contract is one test, in
-[bench/src/lib.rs](../bench/src/lib.rs) at `cross_impl_l2_hash_agreement`:
+Imagine you write a fast order book. Arrays, no allocations, prefetch,
+cache-line tricks, the whole thing. It runs in 30 ns per trade.
+
+Now answer: how do you know it's right?
+
+You can write 200 unit tests. They will catch the bugs you thought
+about. They will not catch the ones you didn't. The whole reason you
+went fast is that you skipped the boring code — and the boring code is
+where correctness comes for free.
+
+The trick used in real HFT shops: **keep the boring version alive
+forever.** Use it as a judge. The fast one is right if and only if it
+agrees with the boring one on every input.
+
+That's what `OrderBook` (the `BTreeMap` one) does in this repo. It is
+not legacy. It is not "the old version". It is the **judge**.
+
+---
+
+## What the fast one does that's risky
+
+[core/src/hot_book.rs](../core/src/hot_book.rs) makes choices that are
+fast but easy to get wrong:
+
+- bids and asks are **fixed arrays** of 256 levels — no `Vec`, no
+  heap allocation per event
+- the struct is **64-byte aligned** with a deliberate **64-byte gap**
+  between bids and asks, so the CPU never accidentally loads bid data
+  while reading asks
+- orders are stored in a **slab** (one big array, reused via free
+  list) with a small `HashMap` pointing into it — 12 bytes per entry
+  instead of 32, so 5× more order lookups fit in one cache line
+- it tells the CPU to **prefetch** the next event one step ahead
+- on a trade, the rare case (full fill) is moved out of the hot path
+  with `#[cold]`, leaving the common case as a straight line
+
+Every one of these can silently produce the wrong state. You wouldn't
+know until a downstream check broke at 3 AM.
+
+The slow `BTreeMap` book has none of these tricks. It walks a sorted
+map and sums quantities. **It cannot lose a level by forgetting to
+shift an array.** The structure does the work.
+
+---
+
+## What the comparison looks like
+
+One test, in [bench/src/lib.rs](../bench/src/lib.rs):
 
 ```rust
 let raw    = synthetic_itch_stream(50_000, 0xC0FFEE);
-let mut parsed = Vec::with_capacity(50_000);
-parse_buffer(&raw, &mut parsed).unwrap();
+let parsed = parse(raw);
 
-let mut hot = HotOrderBook::<256>::new(1);   // fast tactical
-let mut bt  = OrderBook::new(1);              // slow oracle
-let mut cpp = CppOrderBook::new();            // C++ witness
+let mut hot = HotOrderBook::<256>::new(1);   // fast
+let mut bt  = OrderBook::new(1);              // slow judge
+let mut cpp = CppOrderBook::new();            // C++ check
 
 for ev in &parsed {
-    if matches!(ev.event_type,
-        EventType::OrderAdd | EventType::OrderCancel | EventType::Trade)
-    {
-        hot.apply(ev);
-        bt.apply(ev);
-        cpp.apply(ev);
-    }
+    hot.apply(ev);
+    bt.apply(ev);
+    cpp.apply(ev);
 }
 
-let h_hot = hot.canonical_l2_hash();
-let h_bt  = bt.canonical_l2_hash();
-let h_cpp = cpp.state_hash();
-
-assert_eq!(h_hot, h_bt,  "HotOrderBook / OrderBook (BTreeMap) mismatch");
-assert_eq!(h_hot, h_cpp, "Rust / C++ L2 hash mismatch");
+assert_eq!(hot.canonical_l2_hash(), bt.canonical_l2_hash());
+assert_eq!(hot.canonical_l2_hash(), cpp.state_hash());
 ```
 
-Same input. Same canonical L2 hash protocol (xxh3-64 with domain seed
-`XXH3_64bits("FLOWLAB-L2-v1", 13)`, 16 B per level, side separator,
-XOR-fold). Three implementations, one number. The expected agreement
-value is `0xf54ce1b763823e87` — pinned in
-[`docs/feed-design.md`](feed-design.md).
+Same input. Three books. One number each. They must all match.
 
-The test runs in CI as the dedicated job
-**`Cross-language L2 hash agreement gate`** in
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). If any of
-the three diverges by one bit, the build is red.
+The expected number is `0xf54ce1b763823e87`. It's pinned. If the next
+PR touches the hot path and that number changes, CI catches it before
+merge.
 
 ---
 
-## Why three, not two
+## Why three books, not two
 
-Two implementations would already be the textbook reference-vs-hot
-pattern. Flowlab carries a third — the C++ `OrderBook<MaxLevels>`
-template behind `--features native` — for a specific reason.
+Two books would already be the standard "slow judge vs fast worker"
+trick. The third (C++) adds a separate check.
 
-| If divergence is between… | Diagnosis                                       |
-| ------------------------- | ----------------------------------------------- |
-| Hot vs reference (Rust)   | bug in the optimised Rust path                  |
-| Hot+ref vs C++            | bug in the cross-language ABI or in C++ kernel  |
-| Reference vs C++          | bug in the canonical hash protocol (rare; both differ from hot in the same way) |
+| What disagrees                | What that tells you                            |
+| ----------------------------- | ---------------------------------------------- |
+| fast vs slow (both Rust)      | bug in the fast Rust path                      |
+| Rust pair vs C++              | bug in the C++ kernel, or in the FFI layout    |
+| slow vs C++ (rare)            | bug in the canonical hash protocol itself     |
 
-Two witnesses can disagree without telling you who is wrong. **Three
-witnesses triangulate.** Two-against-one is a real signal, not a
-coin flip.
+Two witnesses can disagree without telling you which one lies. Three
+witnesses **triangulate**: two-against-one is a real signal.
 
-This also enforces the 40 B `Event` ABI in code, not just in docs:
-the C++ `OrderBook::apply` reads the same `Event` bytes as the Rust
-ones; if the layout drifts on any side, the hashes diverge before the
-next push.
+The C++ check also forces the `Event` layout (40 bytes, fixed) to stay
+identical between Rust and C++. If anyone shifts a field by accident,
+the hashes diverge before the next push.
 
 ---
 
-## What the slow one is good for besides being right
+## What the comparison checks — and what it doesn't
 
-The `OrderBook` (BTreeMap) is *not* benchmark fodder. It exists to:
+The comparison is on the **L2 hash**. That word matters, so here's the
+plain version.
 
-1. **Be the oracle** for `cross_impl_l2_hash_agreement`. Its
-   correctness is structural — `BTreeMap` cannot lose a level by
-   forgetting to memmove an array. If the slow one says "best bid is
-   X", that is true by construction.
-2. **Document the spec in code.** Anyone reading `apply` in
-   [core/src/orderbook.rs](../core/src/orderbook.rs) understands what
-   an `OrderAdd` is *supposed* to do, in 30 lines, with no tricks.
-   The hot path is then "do exactly this, but faster".
-3. **Survive refactors of the hot path.** Any future rewrite of
-   `HotOrderBook` (different cache strategy, SIMD apply, different
-   slab eviction) is gated by the same hash agreement: the new fast
-   path must reproduce what the slow path computes, byte for byte.
+**L1** = top of book. One bid, one ask. The two best prices.
 
-Deleting the BTreeMap implementation to "clean up" would silently
-remove the oracle and convert the cross-impl test into "two
-implementations of the fast pattern check each other" — which proves
-nothing, because both could share the same bug.
+**L2** = full price ladder, aggregated. *"At price 100 there are 1500
+shares total across 3 orders."* You see the totals per price level, not
+who's behind them.
 
----
+**L3** = every single order. *"At price 100: order #7831 = 500 shares,
+order #9012 = 700 shares, order #9415 = 300 shares."* You see the
+individual orders.
 
-## What this gate does *not* prove
+Flowlab tracks **L3 in the data**: every order has its own ID, slot,
+price, qty, side. Cancels and trades resolve by order ID. Both books
+do this. So L3 is implemented.
 
-Honest scope:
+But the **comparison hash is L2**. Three reasons:
 
-- It proves **state convergence**, not **performance**. The
-  reference is allowed to be 100× slower; that is the deal.
-- It proves **agreement on the canonical hash**, not full L3 order
-  identity. Two books with the same aggregate qty per level but
-  different per-order metadata would still hash equal. That is by
-  design — `canonical_l2_hash` is the L2 invariant, and L3 details
-  are validated by other tests (e.g. `cancel_heavy.rs`,
-  `corruption_injection.rs` in [tests/](../tests/)).
-- It runs on a synthetic ITCH stream of 50 000 events with a fixed
-  seed. Real-world feed shapes (heavy cancel storms, corrupted
-  packets, gap recovery) are validated separately by the chaos and
-  fuzz suites.
+1. **Trading decisions look at L2, not L3.**
+   A market-making strategy decides on *"how much is at the best
+   bid?"*. It doesn't care which trader is behind that number. If the
+   three books agree on the L2 totals, then any strategy running on
+   top makes the **same decisions** regardless of which book it uses.
+   That is the property worth protecting.
 
----
+2. **L3 can disagree without anyone being wrong.**
+   The Rust `HashMap` iterates orders in one order. A different hash
+   table — or a future replacement — iterates them in another. Same
+   orders, same totals, different iteration order. An L3 hash would
+   flag this as a bug. It isn't. It's just a layout detail.
 
-## Why this matters in writing
+   Forcing L3 hashes to match would mean **freezing** every
+   implementation to use the same hash table with the same seed. You
+   lose the freedom to swap structures for zero gain in real
+   correctness.
 
-A team that asks *"how do you trust your hot path?"* in interview is
-not asking for "I wrote tests". They want to hear:
+3. **The market itself works this way.**
+   NASDAQ sends L3 data — every order is visible. But when two
+   implementations need to agree on *"what does the book look like"*,
+   the industry compares at L2. L3 ordering is a fact about your
+   local code, not a fact about the market.
 
-> Three independent implementations — boring Rust BTreeMap as
-> oracle, optimised Rust array+slab as production, C++ template as
-> cross-language witness — fed the same seeded event stream and
-> required to produce the same canonical L2 hash. Gated in CI on
-> every push, fail-fast, no retry.
-
-That answer is one sentence and it is the difference between
-"engineer who writes tests" and "engineer who designed a correctness
-strategy". Flowlab's value is not the order book — it is the gate
-around it.
+So the gate is at the right level. Order-by-order behaviour is checked
+by separate tests like
+[tests/e2e/cancel_heavy.rs](../tests/e2e/cancel_heavy.rs) and
+[tests/chaos/corruption_injection.rs](../tests/chaos/corruption_injection.rs),
+which catch L3 bugs through behaviour (does the right qty get
+cancelled?) rather than through hash equality.
 
 ---
 
-## Limits we do not hide
+## What this is not
 
-- The triangulation only covers **L2 state**. L3 order-tracking
-  drift requires the dedicated chaos tests (cancellation storm,
-  corruption injection).
-- 50 000 events at fixed seed is enough to catch **structural
-  divergence** but not enough to catch a one-in-a-billion edge case;
-  the fuzz harness ([feed-parser/src/fuzz.zig](../feed-parser/src/fuzz.zig))
-  covers parser-level safety, but no fuzz currently runs the
-  three-way book triangulation at random seeds.
-- The C++ implementation lives behind `--features native`. Pure-Rust
-  builds run only the two-way Rust gate (`HotOrderBook` vs
-  `OrderBook`). The full triple-witness gate requires a C++ toolchain.
+- **Not a performance gate.** The slow book is allowed to be 100×
+  slower. Speed is checked elsewhere, in
+  [docs/latency-alpha.md](latency-alpha.md) and
+  [docs/latency-cross-hw.md](latency-cross-hw.md).
+- **Not exhaustive.** 50k events at one seed catches structural
+  bugs, not edge cases that hit one in a billion. The fuzz harness
+  ([feed-parser/src/fuzz.zig](../feed-parser/src/fuzz.zig)) covers
+  parser-level random input separately.
+- **Not free for pure-Rust builds.** The C++ side needs
+  `--features native` and a C++ toolchain. Without it, only the
+  Rust pair (fast vs slow) runs. The full three-way check requires
+  the full toolchain.
+
+---
+
+## Why this matters when talking about it
+
+When someone asks *"how do you know your hot path is correct?"*, the
+answer is one sentence:
+
+> Three independent books — a slow `BTreeMap` one as the judge, a
+> fast array-and-slab one for production, and a C++ template version
+> for cross-language check — get fed the same events and must produce
+> the same hash. Gated in CI, fail-fast.
+
+That's the whole story. The value is not the order book. The value is
+the comparison around it.
