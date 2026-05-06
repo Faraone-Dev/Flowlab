@@ -17,6 +17,10 @@ recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 > 📄 **Latency documents:**
 > - 📈 [`docs/latency-alpha.md`](docs/latency-alpha.md) — α optimisation log: **intrinsic share flip 25 % → 73 %** (cache-bound → compute-bound), rejected alternatives kept with diagnosis
 > - 🔁 [`docs/latency-cross-hw.md`](docs/latency-cross-hw.md) — `HotOrderBook<256>` **TOTAL p50 = 22 ns** reproduced **5/5 across two CPU generations** (AMD Ryzen + Intel i7), zero variance on p50
+>
+> 📐 **Design documents:**
+> - 🎯 [`docs/feed-design.md`](docs/feed-design.md) — why **ITCH replay alone is not enough for chaos**, why the synthetic feed lives in Go, storm parameter discipline, rejected alternatives
+> - 🧱 [`docs/stack-rationale.md`](docs/stack-rationale.md) — **why 4 + 1 languages**, what each layer is forbidden from doing, FFI contract, cost of the multi-language stack (honest)
 
 ### TL;DR
 
