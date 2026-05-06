@@ -3,7 +3,7 @@
 **Deterministic Multi-Language HFT Replay & Adversarial Microstructure Bench**
 
 Rust core + Zig 0.13 ITCH parser + C++20 hot kernels + Go control plane &nbsp;|&nbsp;
-155 tests (133 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
+185 tests (163 Rust + 12 Zig + 10 Go) &nbsp;|&nbsp; 40 B canonical Event ABI &nbsp;|&nbsp;
 MoldUDP64 + WAL + SPSC mmap ring &nbsp;|&nbsp; Rust↔Zig↔C++ canonical L2 hash bit-identical &nbsp;|&nbsp;
 6-guard fail-closed risk gate &nbsp;|&nbsp;
 React/uPlot **CHAOS desk** with 5 live storm injectors and a 3-file run
@@ -25,7 +25,7 @@ recorder (`run.yaml` + `events.jsonl` + `ticks.jsonl`) — see
 | `HotOrderBook::apply` TOTAL p50 (5/5 cross-CPU) | **22 ns** |
 | Cross-impl L2 hash agreement (Rust ↔ Zig ↔ C++) | `0xf54ce1b763823e87` |
 | Snapshot resume | replay-from-checkpoint **≡** replay-from-scratch (e2e proven) |
-| Tests | **155** (133 Rust + 12 Zig + 10 Go) |
+| Tests | **185** (163 Rust + 12 Zig + 10 Go) |
 | Canonical `Event` ABI | **40 B**, frozen, `#[repr(C)]` |
 | Risk gate guards | **6**, fail-closed, latching |
 | Live storm injectors | **5** (Phantom · Cancel · Ignition · Crash · Lat-Arb) |
@@ -505,10 +505,8 @@ Every stage emits an `xxh3_64` digest with domain tag `FLOWLAB-L2-v1`.
 
 ```
 Rust digest  ══╗
-                ╠═══  MUST BE IDENTICAL  (validated)
-Zig digest   ══╝
-
-C++ digest   ══════  WIP — see hotpath/README.md
+Zig digest   ══╣  MUST BE IDENTICAL  (validated, CI-gated)
+C++ digest   ══╝
 ```
 
 - **Rust ↔ Zig:** validated. The Zig parser asserts at `comptime`
@@ -639,23 +637,23 @@ cd feed-parser && zig build test --summary all      # Zig unit tests
 cd ingest      && go test -race -count=1 ./...      # Go
 ```
 
-Passing counts (verified by `cargo test --workspace` + `zig build
-test` + `go test ./...`): **155 total** = 133 Rust + 12 Zig + 10 Go.
-Breakdown:
+Passing counts (verified by `cargo test --workspace --features native`
++ `zig build test` + `go test ./...`): **185 total** = 163 Rust + 12 Zig
++ 10 Go. Breakdown:
 
-| Surface                                       | Tests   |
-| --------------------------------------------- | ------- |
-| `flowlab-chaos` (5 storm injectors + legacy)  | 51      |
-| `flowlab-replay` (unit + integration)         | 37 + 2  |
-| `flowlab-e2e` (chaos + e2e + fuzz harnesses)  | 23      |
-| `flowlab-flow` (circuit breaker, analytics)   | 10      |
-| `flowlab-core` (`hot_book`, event, state)     | 8       |
-| `flowlab-engine` (lib + main + ich_real)      | 3       |
-| `flowlab-bench` (cross-impl hash agreement)   | 2       |
-| `flowlab-verify`                              | 1       |
-| Zig `feed-parser` (`itch.zig` + `main.zig`)   | 12      |
-| Go `ingest/` (mmap ring + WS feed)            | 6       |
-| Go `api/` (regime parity vs Rust)             | 4       |
+| Surface                                                            | Tests       |
+| ------------------------------------------------------------------ | ----------- |
+| `flowlab-chaos` (5 storm injectors + legacy + clustering)          | 71          |
+| `flowlab-replay` (unit + `ring_ipc`)                               | 38 + 2      |
+| `flowlab-e2e` (chaos drift / e2e / fuzz / `cpp_hasher_agreement` / `snapshot_resume`) | 22 |
+| `flowlab-core` (`hot_book` + snapshot + event + state)             | 15          |
+| `flowlab-flow` (circuit breaker, analytics, regime)                | 8           |
+| `flowlab-bench` (cross-impl hash gate + latency bins)              | 5           |
+| `flowlab-engine` (lib + `ich_real`)                                | 1           |
+| Doctest                                                            | 1           |
+| Zig `feed-parser` (`itch.zig` + `main.zig`)                        | 12          |
+| Go `ingest/` (mmap ring + WS feed)                                 | 6           |
+| Go `api/` (regime parity vs Rust)                                  | 4           |
 
 ### Test layout
 
@@ -784,19 +782,31 @@ banners.
 - Three chaos integration tests: 10 M-event drift, corruption
   injection, multi-thread burst desync
 - C++ `OrderBook<MaxLevels>` (flat-array L2) and Welford
-  `RollingStats` header, callable through the FFI
+  `RollingStats` header, callable through the FFI. AVX2 batch update
+  was prototyped and **rejected** at engine tick cadence (~50 Hz, batch
+  size 1, SIMD prologue dominates over scalar Welford); rationale
+  preserved in [hotpath/src/stats.cpp](hotpath/src/stats.cpp)
 - Snapshot binary format: `FLSN` magic, versioned, little-endian
-  layout, hand-rolled (no schema crate dep)
+  layout, hand-rolled (no schema crate dep). `replay-from-checkpoint
+  ≡ replay-from-scratch` proven by [tests/e2e/snapshot_resume.rs](tests/e2e/snapshot_resume.rs)
 - Windows mmap ring writer via `CreateFileMapping` + `MapViewOfFile`,
   byte-identical to the POSIX layout
+- **Chaos passive detectors wired into the engine hot loop.** All 5
+  detectors live behind `ChaosChain::default_itch()` in
+  [engine/src/engine.rs](engine/src/engine.rs); every applied event runs
+  through `process_into` with a reused buffer (zero per-event alloc),
+  emissions are broadcast as `ChaosFrame` on the telemetry wire
+- **CI cross-impl L2 hash gate enforced on every push.** Job
+  `Cross-language L2 hash agreement gate` in
+  [.github/workflows/ci.yml](.github/workflows/ci.yml) runs
+  `cargo test -p flowlab-bench --features native --
+  cross_impl_l2_hash_agreement`; any Rust↔C++ digest drift fails the
+  build
 
 **Partial — landed but not yet at full scope:**
 
 | Item | What's done / what's missing | Reference |
 | ---- | ---------------------------- | --------- |
-| C++ SIMD batch stats | Header-only `RollingStats` (Welford, `O(1)`) is real and used in the FFI; AVX2 batch update is a placeholder | [hotpath/src/stats.cpp](hotpath/src/stats.cpp) |
-| Chaos passive detectors | All 5 detectors implemented + 41 unit tests green; `ChaosChain` runs in benches (`chaos_throughput`, `chaos_latency`) but is **not yet cabled into the engine runtime** — passive classification of live storms is the next wire-up | [chaos/src/chain.rs](chaos/src/chain.rs) |
-| CI cross-impl hash gate | `bench_cpp_agreement` asserts byte-for-byte digest equality between Rust and C++ in [bench/benches/pipeline.rs](bench/benches/pipeline.rs); CI currently builds the bench (`--no-run`) but does not execute the assertion. The gate exists in code but is not enforced on every push yet | [.github/workflows/ci.yml](.github/workflows/ci.yml) |
 | Lab matching engine | Removed deliberately in favor of adapting external trading bots through the `/bot/state` adapter; see Adversarial Desk above | [api/server/bot_proxy.go](api/server/bot_proxy.go) |
 | Control API | `/health`, `/status`, `/stream`, `/storm/*`, `/run/*`, `/bot/*` implemented; `/metrics` (Prometheus) and `/ingest/*` are not yet wired | [api/server/server.go](api/server/server.go) |
 
