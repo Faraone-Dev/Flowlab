@@ -115,6 +115,16 @@ pub struct EngineConfig {
     pub vpin_bucket: u64,
     pub vpin_buckets: usize,
     pub spread_window: usize,
+
+    // ── snapshotting ─────────────────────────────────────────────
+    /// If `Some`, write a snapshot file every `snapshot_every`. The
+    /// engine still operates if this is `None`; snapshotting is
+    /// strictly opt-in to keep the default path alloc-free.
+    pub snapshot_every: Option<Duration>,
+    /// File path the snapshot is written to (atomic rename). The
+    /// previous snapshot is overwritten — checkpoints are intended
+    /// for resume, not history.
+    pub snapshot_out: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -133,6 +143,8 @@ impl Default for EngineConfig {
             vpin_bucket: 10_000,
             vpin_buckets: 50,
             spread_window: 256,
+            snapshot_every: None,
+            snapshot_out: None,
         }
     }
 }
@@ -281,6 +293,30 @@ impl Engine {
         }
     }
 
+    /// Construct an engine and immediately seed its book + sequence
+    /// number from a previously-written snapshot. The caller is
+    /// responsible for verifying `snapshot.state_hash` against the
+    /// restored book if a paranoid roundtrip check is desired.
+    pub fn with_snapshot(
+        cfg: EngineConfig,
+        snapshot: flowlab_replay::snapshot::Snapshot,
+    ) -> Result<Self, flowlab_core::hot_book::BookSnapshotError> {
+        let mut engine = Self::new(cfg);
+        engine.book = HotOrderBook::<256>::from_snapshot_bytes(&snapshot.book_data)?;
+        engine.seq = snapshot.seq;
+        // If the snapshot pinned a specific instrument, treat it as a
+        // hard lock — the operator opted into resuming that name and
+        // any subsequent auto-lock churn would silently drop events.
+        engine.tracked = Some(engine.book.instrument_id);
+        tracing::info!(
+            seq = snapshot.seq,
+            state_hash = format!("{:016x}", snapshot.state_hash),
+            instrument_id = engine.book.instrument_id,
+            "engine resumed from snapshot"
+        );
+        Ok(engine)
+    }
+
     /// Drain the source forever (or until exhausted), publishing telemetry.
     pub fn run(mut self, source: &mut dyn Source, out: Producer<TelemetryFrame>) {
         // Header frame first.
@@ -299,6 +335,9 @@ impl Engine {
         let mut next_tick = Instant::now() + tick_period;
         let mut next_book = Instant::now() + book_period;
         let mut next_eps = Instant::now() + Duration::from_secs(1);
+        let snapshot_every = self.cfg.snapshot_every;
+        let snapshot_out = self.cfg.snapshot_out.clone();
+        let mut next_snapshot = snapshot_every.map(|d| Instant::now() + d);
 
         loop {
             // ── pull next event
@@ -503,6 +542,28 @@ impl Engine {
 
             // ── periodic publishes
             let now = Instant::now();
+
+            // ── periodic snapshot (atomic-rename, opt-in)
+            //    Writes a `Snapshot { seq, state_hash, book_data }`
+            //    file every `snapshot_every`. Cost on tick: one
+            //    `to_snapshot_bytes()` (≈ a few µs at 256-level books)
+            //    plus an fsync via `rename`. Skipped entirely if the
+            //    operator did not pass `--snapshot-out`.
+            if let (Some(period), Some(path)) = (snapshot_every, snapshot_out.as_ref()) {
+                if now >= next_snapshot.unwrap_or(now) {
+                    let snap = flowlab_replay::snapshot::Snapshot {
+                        seq: self.seq,
+                        state_hash: self.book.canonical_l2_hash(),
+                        book_data: self.book.to_snapshot_bytes(),
+                    };
+                    if let Err(e) = snap.write_to_path(path) {
+                        tracing::warn!(error = %e, path = %path.display(),
+                            "snapshot write failed");
+                    }
+                    next_snapshot = Some(now + period);
+                }
+            }
+
             if now >= next_eps {
                 let elapsed = now.duration_since(self.window_started).as_secs_f64().max(1e-3);
                 self.last_eps = (self.events_in_window as f64 / elapsed) as u64;

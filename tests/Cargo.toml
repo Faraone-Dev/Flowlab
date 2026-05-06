@@ -41,6 +41,10 @@ name = "e2e_stress_overflow"
 path = "e2e/stress_overflow.rs"
 
 [[test]]
+name = "e2e_snapshot_resume"
+path = "e2e/snapshot_resume.rs"
+
+[[test]]
 name = "fuzz_orderbook_consistency"
 path = "fuzz/orderbook_consistency.rs"
 

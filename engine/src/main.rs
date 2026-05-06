@@ -75,6 +75,24 @@ struct Cli {
     /// liquid ticker in the feed.
     #[arg(long)]
     symbol: Option<String>,
+
+    /// Resume the engine from a previously-written snapshot file
+    /// (`Snapshot` wire format, magic `FLSN`). The book state and
+    /// `seq` are restored before the source starts draining. The
+    /// snapshot's instrument_id becomes a hard symbol lock.
+    #[arg(long)]
+    resume_from: Option<std::path::PathBuf>,
+
+    /// Write a snapshot to `--snapshot-out` every N seconds. Requires
+    /// `--snapshot-out`. Off by default.
+    #[arg(long)]
+    snapshot_every_secs: Option<u64>,
+
+    /// Destination path for periodic snapshots. The file is rewritten
+    /// atomically (tmp + rename) so a crash mid-write leaves the
+    /// previous good snapshot intact.
+    #[arg(long)]
+    snapshot_out: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -176,13 +194,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     // Engine drives the Source on the main thread.
+    let snapshot_every = cli
+        .snapshot_every_secs
+        .map(std::time::Duration::from_secs);
+    if cli.snapshot_every_secs.is_some() && cli.snapshot_out.is_none() {
+        return Err("--snapshot-every-secs requires --snapshot-out".into());
+    }
     let cfg = EngineConfig {
         tick_publish_hz: cli.tick_hz,
         book_publish_hz: cli.book_hz,
         track_instrument: tracked,
+        snapshot_every,
+        snapshot_out: cli.snapshot_out.clone(),
         ..Default::default()
     };
-    let engine = Engine::new(cfg);
+    let engine = if let Some(path) = cli.resume_from.as_ref() {
+        let snap = flowlab_replay::snapshot::Snapshot::read_from_path(path)
+            .map_err(|e| format!("resume failed reading {}: {e}", path.display()))?;
+        info!(
+            path = %path.display(),
+            seq = snap.seq,
+            state_hash = format!("{:016x}", snap.state_hash),
+            "resuming from snapshot"
+        );
+        Engine::with_snapshot(cfg, snap)
+            .map_err(|e| format!("resume failed restoring book: {e}"))?
+    } else {
+        Engine::new(cfg)
+    };
     engine.run(source.as_mut(), producer);
 
     Ok(())
