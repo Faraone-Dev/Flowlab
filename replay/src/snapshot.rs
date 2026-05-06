@@ -88,6 +88,36 @@ impl Snapshot {
             book_data: payload[..declared].to_vec(),
         })
     }
+
+    /// Atomic write: serialise to `<path>.tmp` then rename. Avoids
+    /// leaving a half-written snapshot behind if the process is
+    /// killed mid-write — the next resume just falls back to the
+    /// previous good file.
+    pub fn write_to_path(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp = path.with_extension("flsn.tmp");
+        std::fs::write(&tmp, self.to_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Read + decode in one shot.
+    pub fn read_from_path(path: &std::path::Path) -> Result<Self, SnapshotIoError> {
+        let bytes = std::fs::read(path).map_err(SnapshotIoError::Io)?;
+        Self::from_bytes(&bytes).map_err(SnapshotIoError::Decode)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotIoError {
+    #[error("snapshot I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("snapshot decode error: {0}")]
+    Decode(#[from] SnapshotError),
 }
 
 #[cfg(test)]

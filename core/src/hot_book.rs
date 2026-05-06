@@ -760,6 +760,208 @@ impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
     }
 }
 
+// ─── Snapshot serialisation (deterministic, bytewise round-trip) ────
+//
+// Wire layout for `to_snapshot_bytes` / `from_snapshot_bytes`. All
+// values little-endian, fixed-width — no padding, no schema crate.
+//
+//   [0..4)    instrument_id        u32
+//   [4..8)    bid_count            u32
+//   [8..12)   ask_count            u32
+//   [12..16)  max_levels           u32   sanity-check at load
+//   ── then for each side, count*24 B of `Level` (price,qty,order_count) ──
+//   [..]      bid_levels[bid_count]  Level (24 B each)
+//   [..]      ask_levels[ask_count]  Level (24 B each)
+//   ── slab + index, sorted by oid for determinism ──
+//   [..]      slab_data_len        u32
+//   [..]      slab_data[slab_data_len] OrderMeta (24 B each)
+//   [..]      free_list_len        u32
+//   [..]      free_list[free_list_len] u32
+//   [..]      index_len            u32
+//   [..]      index[(u64 oid, u32 slot)] (12 B each)  -- sorted by oid asc
+//
+// The index is sorted so two engines that processed the same event
+// stream produce byte-identical snapshots regardless of HashMap
+// iteration order. Round-trip is verified by `canonical_l2_hash`
+// equality + slab data equality in tests.
+const SNAPSHOT_HEADER_LEN: usize = 16;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BookSnapshotError {
+    #[error("snapshot too short: {0} bytes")]
+    Truncated(usize),
+    #[error("declared MAX_LEVELS {got} != compiled-in {expected}")]
+    LevelsMismatch { got: u32, expected: u32 },
+    #[error("declared count {got} exceeds MAX_LEVELS {max}")]
+    CountExceedsMax { got: u32, max: u32 },
+    #[error("declared len {declared} exceeds remaining payload {actual}")]
+    BadLength { declared: usize, actual: usize },
+}
+
+#[inline]
+fn write_level(out: &mut Vec<u8>, l: &Level) {
+    out.extend_from_slice(&l.price.to_le_bytes());
+    out.extend_from_slice(&l.total_qty.to_le_bytes());
+    out.extend_from_slice(&l.order_count.to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]); // _pad — keeps 24 B layout
+}
+
+#[inline]
+fn read_level(buf: &[u8]) -> Level {
+    let price = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let total_qty = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let order_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+    Level { price, total_qty, order_count, _pad: 0 }
+}
+
+#[inline]
+fn write_meta(out: &mut Vec<u8>, m: &OrderMeta) {
+    out.extend_from_slice(&m.price.to_le_bytes());
+    out.extend_from_slice(&m.qty.to_le_bytes());
+    out.push(m.side);
+    out.extend_from_slice(&[0u8; 7]); // _pad — keeps 24 B layout
+}
+
+#[inline]
+fn read_meta(buf: &[u8]) -> OrderMeta {
+    let price = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let qty = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let side = buf[16];
+    OrderMeta { price, qty, side, _pad: [0; 7] }
+}
+
+impl<const MAX_LEVELS: usize> HotOrderBook<MAX_LEVELS> {
+    /// Serialise the book to a byte buffer suitable for resumption.
+    ///
+    /// Iteration order over the slab index is normalised (sorted by
+    /// `order_id` ascending) so the output is byte-identical for two
+    /// engines that processed the same event stream — a property
+    /// required by the cross-impl snapshot agreement test.
+    pub fn to_snapshot_bytes(&self) -> Vec<u8> {
+        let bid_count = self.bid_count as usize;
+        let ask_count = self.ask_count as usize;
+        let slab_len = self.orders.data.len();
+        let free_len = self.orders.free_list.len();
+        let index_len = self.orders.index.len();
+        let cap = SNAPSHOT_HEADER_LEN
+            + (bid_count + ask_count) * 24
+            + 4 + slab_len * 24
+            + 4 + free_len * 4
+            + 4 + index_len * 12;
+        let mut out = Vec::with_capacity(cap);
+
+        out.extend_from_slice(&self.instrument_id.to_le_bytes());
+        out.extend_from_slice(&self.bid_count.to_le_bytes());
+        out.extend_from_slice(&self.ask_count.to_le_bytes());
+        out.extend_from_slice(&(MAX_LEVELS as u32).to_le_bytes());
+
+        for l in &self.bids[..bid_count] { write_level(&mut out, l); }
+        for l in &self.asks[..ask_count] { write_level(&mut out, l); }
+
+        out.extend_from_slice(&(slab_len as u32).to_le_bytes());
+        for m in &self.orders.data { write_meta(&mut out, m); }
+        out.extend_from_slice(&(free_len as u32).to_le_bytes());
+        for s in &self.orders.free_list { out.extend_from_slice(&s.to_le_bytes()); }
+
+        // Sort index entries by oid for deterministic serialisation.
+        let mut idx: Vec<(u64, u32)> = self.orders.index.iter().map(|(k, v)| (*k, *v)).collect();
+        idx.sort_unstable_by_key(|(k, _)| *k);
+        out.extend_from_slice(&(index_len as u32).to_le_bytes());
+        for (oid, slot) in idx {
+            out.extend_from_slice(&oid.to_le_bytes());
+            out.extend_from_slice(&slot.to_le_bytes());
+        }
+        out
+    }
+
+    /// Restore a book from a buffer produced by [`Self::to_snapshot_bytes`].
+    ///
+    /// Validates the embedded `MAX_LEVELS` against the type's compile-time
+    /// parameter — refusing the load instead of silently truncating.
+    pub fn from_snapshot_bytes(buf: &[u8]) -> Result<Self, BookSnapshotError> {
+        if buf.len() < SNAPSHOT_HEADER_LEN {
+            return Err(BookSnapshotError::Truncated(buf.len()));
+        }
+        let instrument_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let bid_count = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let ask_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let declared_max = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        if declared_max != MAX_LEVELS as u32 {
+            return Err(BookSnapshotError::LevelsMismatch {
+                got: declared_max,
+                expected: MAX_LEVELS as u32,
+            });
+        }
+        if bid_count > MAX_LEVELS as u32 || ask_count > MAX_LEVELS as u32 {
+            return Err(BookSnapshotError::CountExceedsMax {
+                got: bid_count.max(ask_count),
+                max: MAX_LEVELS as u32,
+            });
+        }
+
+        let mut book = Self::new(instrument_id);
+        book.bid_count = bid_count;
+        book.ask_count = ask_count;
+
+        let mut p = SNAPSHOT_HEADER_LEN;
+        let want = (bid_count as usize + ask_count as usize) * 24;
+        if buf.len() < p + want {
+            return Err(BookSnapshotError::BadLength { declared: want, actual: buf.len() - p });
+        }
+        for i in 0..bid_count as usize {
+            book.bids[i] = read_level(&buf[p..p + 24]);
+            p += 24;
+        }
+        for i in 0..ask_count as usize {
+            book.asks[i] = read_level(&buf[p..p + 24]);
+            p += 24;
+        }
+
+        // Slab data.
+        if buf.len() < p + 4 { return Err(BookSnapshotError::Truncated(buf.len())); }
+        let slab_len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if buf.len() < p + slab_len * 24 {
+            return Err(BookSnapshotError::BadLength { declared: slab_len * 24, actual: buf.len() - p });
+        }
+        book.orders.data = Vec::with_capacity(slab_len);
+        for _ in 0..slab_len {
+            book.orders.data.push(read_meta(&buf[p..p + 24]));
+            p += 24;
+        }
+
+        // Free list.
+        if buf.len() < p + 4 { return Err(BookSnapshotError::Truncated(buf.len())); }
+        let free_len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if buf.len() < p + free_len * 4 {
+            return Err(BookSnapshotError::BadLength { declared: free_len * 4, actual: buf.len() - p });
+        }
+        book.orders.free_list = Vec::with_capacity(free_len);
+        for _ in 0..free_len {
+            book.orders.free_list.push(u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()));
+            p += 4;
+        }
+
+        // Index.
+        if buf.len() < p + 4 { return Err(BookSnapshotError::Truncated(buf.len())); }
+        let index_len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if buf.len() < p + index_len * 12 {
+            return Err(BookSnapshotError::BadLength { declared: index_len * 12, actual: buf.len() - p });
+        }
+        book.orders.index.reserve(index_len);
+        for _ in 0..index_len {
+            let oid = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+            let slot = u32::from_le_bytes(buf[p + 8..p + 12].try_into().unwrap());
+            book.orders.index.insert(oid, slot);
+            p += 12;
+        }
+
+        Ok(book)
+    }
+}
+
 // ─── Compile-time verification ───────────────────────────────────────
 
 const _: () = {
@@ -1063,5 +1265,93 @@ mod tests {
             lanes.canonical_l2_hash(),
             "apply_lanes must produce identical post-batch state to serial apply"
         );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_empty_book() {
+        let book: HotOrderBook<256> = HotOrderBook::new(42);
+        let bytes = book.to_snapshot_bytes();
+        let restored = HotOrderBook::<256>::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restored.instrument_id, 42);
+        assert_eq!(restored.canonical_l2_hash(), book.canonical_l2_hash());
+        assert_eq!(restored.bid_count, 0);
+        assert_eq!(restored.ask_count, 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_state_exactly() {
+        // Build a non-trivial book with adds, modifies, partial cancels.
+        let mut book: HotOrderBook<256> = HotOrderBook::new(7);
+        let mut oid = 1u64;
+        for i in 0..40 {
+            let mut e = make_event(EventType::OrderAdd, Side::Bid, 10_000 - i, 100 + i * 7);
+            e.order_id = oid; oid += 1;
+            book.apply(&e);
+
+            let mut e = make_event(EventType::OrderAdd, Side::Ask, 10_010 + i, 200 + i * 3);
+            e.order_id = oid; oid += 1;
+            book.apply(&e);
+        }
+        // Cancel a few to exercise the free_list path.
+        for cancel_oid in [3u64, 7, 11, 41, 55] {
+            let mut e = make_event(EventType::OrderCancel, Side::Bid, 0, 0);
+            e.order_id = cancel_oid;
+            book.apply(&e);
+        }
+
+        let bytes = book.to_snapshot_bytes();
+        let restored = HotOrderBook::<256>::from_snapshot_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.canonical_l2_hash(), book.canonical_l2_hash(),
+            "L2 hash must agree after roundtrip");
+        assert_eq!(restored.instrument_id, book.instrument_id);
+        assert_eq!(restored.bid_count, book.bid_count);
+        assert_eq!(restored.ask_count, book.ask_count);
+        assert_eq!(restored.orders.data.len(), book.orders.data.len());
+        assert_eq!(restored.orders.free_list, book.orders.free_list);
+        assert_eq!(restored.orders.index.len(), book.orders.index.len());
+
+        // Determinism: a second serialise must produce byte-identical output.
+        let bytes2 = restored.to_snapshot_bytes();
+        assert_eq!(bytes, bytes2, "snapshot must be byte-deterministic");
+    }
+
+    #[test]
+    fn snapshot_continuing_apply_matches_full_replay() {
+        // Replay 40 events, snapshot, then apply 20 more.
+        // Compare against a fresh book that processes all 60 events.
+        let events: Vec<Event> = (0..60).flat_map(|i| {
+            vec![
+                {
+                    let mut e = make_event(EventType::OrderAdd, Side::Bid, 10_000 - i % 50, 100 + i);
+                    e.order_id = (i * 2 + 1) as u64; e
+                },
+                {
+                    let mut e = make_event(EventType::OrderAdd, Side::Ask, 10_010 + i % 50, 200 + i);
+                    e.order_id = (i * 2 + 2) as u64; e
+                },
+            ]
+        }).collect();
+
+        let mut snap_book: HotOrderBook<256> = HotOrderBook::new(1);
+        for ev in &events[..80] { snap_book.apply(ev); }
+        let snap_bytes = snap_book.to_snapshot_bytes();
+
+        let mut resumed = HotOrderBook::<256>::from_snapshot_bytes(&snap_bytes).unwrap();
+        for ev in &events[80..] { resumed.apply(ev); }
+
+        let mut full: HotOrderBook<256> = HotOrderBook::new(1);
+        for ev in &events { full.apply(ev); }
+
+        assert_eq!(resumed.canonical_l2_hash(), full.canonical_l2_hash(),
+            "replay-from-snapshot must converge to from-scratch state");
+    }
+
+    #[test]
+    fn snapshot_rejects_max_levels_mismatch() {
+        let book: HotOrderBook<256> = HotOrderBook::new(1);
+        let bytes = book.to_snapshot_bytes();
+        let err = HotOrderBook::<128>::from_snapshot_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, BookSnapshotError::LevelsMismatch { .. }));
     }
 }
